@@ -192,10 +192,8 @@ export async function applyUpdateToRoom(
   };
   roomObj.log.push(logEntry);
 
-  // 5. Construct DB row
-  const key = [roomObj.level, roomObj.zone, roomObj.space, roomObj.spaceNo || '', roomObj.spaceCode || ''].join('|');
+  // 5. Construct DB row (matching Supabase public.rooms columns)
   const dbRow = {
-    key,
     id: roomObj.id,
     level: roomObj.level,
     zone: roomObj.zone,
@@ -212,14 +210,14 @@ export async function applyUpdateToRoom(
     updated: nowIso
   };
 
-  const { error: upsertError } = await sb.from('rooms').upsert([dbRow], { onConflict: 'key' });
+  const { error: upsertError } = await sb.from('rooms').upsert([dbRow], { onConflict: 'id' });
   if (upsertError) {
     console.error('Supabase upsert error:', upsertError);
     throw upsertError;
   }
 
   return {
-    roomKey: key,
+    roomKey: roomObj.id,
     roomTitle: `L${roomObj.level} ${roomObj.spaceNo ? 'Room ' + roomObj.spaceNo : roomObj.space}`
   };
 }

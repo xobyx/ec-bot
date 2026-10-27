@@ -8,6 +8,8 @@ binding = "AI"
 [vars]
 SUPABASE_URL = "https://ynrgbmssbilugflxtpfx.supabase.co"
 SUPABASE_BUCKET = "photos"
+SUPABASE_SERVICE_ROLE_KEY = "sb_secret_R0bW7ZnMKDqVOYH2CZZ5NA_BBLQi1F-"
+TELEGRAM_BOT_TOKEN = "8965670177:AAEGYhSFUxOtZw5cqYTVMGaQjrmZD5jCuuY"
 
 # Secrets to set via `npx wrangler secret put <NAME>`:
 # - TELEGRAM_BOT_TOKEN
