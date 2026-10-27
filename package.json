@@ -1,0 +1,19 @@
+{
+  "name": "ecit-telegram-bot-worker",
+  "version": "1.0.0",
+  "description": "Telegram bot Cloudflare Worker for ECIT site progress tracking with AI analysis and Supabase integration",
+  "main": "src/index.ts",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.4"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20240405.0",
+    "typescript": "^5.9.3",
+    "wrangler": "^3.90.0"
+  }
+}

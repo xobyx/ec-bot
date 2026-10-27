@@ -1,0 +1,16 @@
+name = "ecit-telegram-bot"
+main = "src/index.ts"
+compatibility_date = "2024-04-01"
+
+[ai]
+binding = "AI"
+
+[vars]
+SUPABASE_URL = "https://ynrgbmssbilugflxtpfx.supabase.co"
+SUPABASE_BUCKET = "photos"
+
+# Secrets to set via `npx wrangler secret put <NAME>`:
+# - TELEGRAM_BOT_TOKEN
+# - SUPABASE_SERVICE_ROLE_KEY
+# - GEMINI_API_KEY (optional: if you want to use Google Gemini Flash as an alternative/fallback)
+# - WEBHOOK_SECRET (optional: recommended random token to verify Telegram requests)
