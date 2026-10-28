@@ -91,7 +91,7 @@ export async function applyUpdateToRoom(
   const targetZone = typeof parsed.zone === 'number' ? parsed.zone : 0;
   const targetSpaceCode = parsed.spaceCode || targetSpaceNo;
 
-  // Search existing rooms in Supabase matching this level and spaceNo
+  // Search existing rooms in Supabase matching this level and zone
   let existingRoomRow: any = null;
   const { data: rows, error: searchError } = await sb
     .from('rooms')
@@ -99,12 +99,34 @@ export async function applyUpdateToRoom(
     .eq('level', targetLevel);
 
   if (!searchError && rows && rows.length > 0) {
-    // Find matching room by spaceNo or spaceCode or space
-    existingRoomRow = rows.find(
-      (r: any) =>
-        (targetSpaceNo && (r.space_no === targetSpaceNo || r.space_code === targetSpaceNo)) ||
-        (targetSpace && r.space && r.space.toUpperCase().includes(targetSpace.toUpperCase()))
-    );
+    const cleanSpace = targetSpace.trim().toUpperCase();
+
+    // 1. First priority: match exact room number/code if explicitly provided
+    if (targetSpaceNo) {
+      existingRoomRow = rows.find(
+        (r: any) =>
+          r.space_no?.toUpperCase() === targetSpaceNo ||
+          r.space_code?.toUpperCase() === targetSpaceNo
+      );
+    }
+
+    // 2. Second priority: match targetZone AND space name (e.g. Zone 2 + GARBAGE ROOM / G. SERVICE ROOM)
+    if (!existingRoomRow && cleanSpace && cleanSpace !== 'SITE') {
+      existingRoomRow = rows.find((r: any) => {
+        const zoneMatch = targetZone === 0 || r.zone === targetZone || r.zone === 0;
+        const rSpace = (r.space || '').toUpperCase();
+        const spaceMatch = rSpace.includes(cleanSpace) || cleanSpace.includes(rSpace);
+        return zoneMatch && spaceMatch;
+      });
+    }
+
+    // 3. Third priority: match space name anywhere on this level
+    if (!existingRoomRow && cleanSpace && cleanSpace !== 'SITE') {
+      existingRoomRow = rows.find((r: any) => {
+        const rSpace = (r.space || '').toUpperCase();
+        return rSpace.includes(cleanSpace) || cleanSpace.includes(rSpace);
+      });
+    }
   }
 
   const nowIso = new Date().toISOString();
@@ -151,7 +173,13 @@ export async function applyUpdateToRoom(
 
   // 1. Update finish check if provided
   if (parsed.finishCode && parsed.status) {
-    roomObj.checks[parsed.finishCode] = parsed.status;
+    let targetFinish = parsed.finishCode;
+    // Smart screed fallback: if AI guessed F03 but room uses F02 (or vice versa), align with room's checks
+    if ((targetFinish === 'F03' || targetFinish === 'F02') && !roomObj.checks[targetFinish]) {
+      if (roomObj.checks['F02']) targetFinish = 'F02';
+      else if (roomObj.checks['F03']) targetFinish = 'F03';
+    }
+    roomObj.checks[targetFinish] = parsed.status;
   }
 
   // 2. Add snag if detected

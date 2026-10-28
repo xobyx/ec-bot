@@ -1,4 +1,4 @@
-name = "ecit-telegram-bot"
+name = "ec-bot"
 main = "src/index.ts"
 compatibility_date = "2024-04-01"
 

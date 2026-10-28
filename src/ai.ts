@@ -5,30 +5,60 @@ Your job is to analyze site messages and photos submitted by site engineers via 
 
 Project details:
 - Levels: 0 (Ground), 1 (1st), 2 (2nd), 3 (3rd), 4 (4th), 5 (5th), 6 (6th), 7 (7th), 8 (8th).
+- Zones: 1, 2, 3, 4, or 0 (all zones). If message mentions "zone 2" or "z2", zone MUST be 2.
+- Known Space Names:
+  GARBAGE ROOM, GARBAGE CHUTE, POD TOILET, MALE TOILET, FEMALE TOILET, TOILET, CORRIDOR, 2.40 M SERVICE CORRIDOR,
+  JANITOR, STORE ROOM, FM OFFICE & STORE, FM OFFICE PANTRY, AHU ROOM, ELEC. ROOM, ELEC. CABINET, ELV. RM.,
+  LIFT LOBBY, SERVICE LIFT LOBBY, STAIRCASE, AUDITORIUM, PRODUCTION ROOM, CCU ROOM, GENERATOR ROOM,
+  IDF RM, SERVER ROOM, KITCHEN, PANTRY, MEP, SHAFT, P.SHAFT, F.H.R., OFFICE SPACE.
+
 - Finish Categories and common codes:
-  * Floor (F): F01, F02 (Power floated screed), F03 (Screed), F05 (PU resin), F06 (Epoxy), F08 (Porcelain tiles), F09 (Ceramic tiles), F15 (Marble), F16 (Porcelain).
-  * Wall (W): W01, W02 (Spray plaster), W03 (Cement plaster), W04 (Paint system-1 washable), W05 (Paint system-2 anti-fungal), W07 (Glazed ceramic tiles), W08 (Porcelain tiles).
-  * Ceiling (C): C01, C03 (Gypsum board ceiling), C03A (MR gypsum), C07 (Fine line 600x600 tiles), C08 (Exposed T-grid tiles).
+  * Floor (F):
+    - F02: Power floated screed with fibres (standard screed in garbage rooms, service corridors, utility rooms, plant rooms)
+    - F03: Screed for vinyl/carpet/tiles (toilets, auditoriums)
+    - F06: Epoxy coating
+    - F08: Vitrified porcelain tiles
+    - F09: Glazed ceramic tiles
+    - F16: 20mm full body porcelain
+  * Wall (W):
+    - W01: Bare blockwork
+    - W02: Spray plaster
+    - W03: Cement sand plaster
+    - W04: Paint system-1 washable
+    - W05 / W05A / W05B: Anti-fungal paint systems
+    - W07 / W08 / W90: Wall tiles
+  * Ceiling (C):
+    - C01: Bare slab soffit
+    - C03: Gypsum board ceiling
+    - C07 / C08: 600x600 Gypsum tiles on exposed T-grid
   * Skirting (S): S01-S13.
+
 - Status values must be strictly: "pending", "ongoing", "done", or null if not mentioned.
 - Snag trades: "Painting", "Plastering", "Tiling", "Flooring", "Ceiling", "MEP", "Electrical", "Plumbing", "HVAC", "Carpentry", "Civil", "Cleaning", "General".
+
+CRITICAL EXTRACTION RULES:
+1. "space": Put the uppercase Space Name here (e.g. "GARBAGE ROOM", "POD TOILET", "CORRIDOR").
+2. "spaceNo": ONLY fill this if the user EXPLICITLY wrote a room number (e.g. "204", "105", "G-01").
+   If the user only named the space (e.g. "garbage room", "toilet"), spaceNo MUST BE null! DO NOT INVENT A ROOM NUMBER.
+3. "zone": Extract the zone number (1, 2, 3, 4). If the user mentions "zone 2", zone MUST BE 2.
+4. "finishCode": If user mentions "screed" in a service area, garbage room, or corridor, map to "F02".
 
 You MUST return ONLY a valid JSON object with the following schema:
 {
   "level": number or null,
-  "zone": number or null (1 to 4, or 0 if common/all),
-  "space": string or null (e.g. "CORRIDOR", "MALE TOILET", "OFFICE SPACE", "IDF RM" or room code like "204"),
-  "spaceNo": string or null (e.g. "204", "G01", "102"),
+  "zone": number or null,
+  "space": string or null,
+  "spaceNo": string or null,
   "spaceCode": string or null,
-  "finishCode": string or null (e.g. "F02", "W04", "C03"),
+  "finishCode": string or null,
   "finishKind": "Floor" | "Skirting" | "Wall" | "Ceiling" | null,
   "status": "pending" | "ongoing" | "done" | null,
   "snag": {
-    "text": string (description of defect),
-    "trade": string (trade responsible)
+    "text": string,
+    "trade": string
   } or null,
-  "notes": string (brief progress or inspection note),
-  "summary": string (1-2 sentences human readable summary of the update)
+  "notes": string,
+  "summary": string
 }
 No markdown fences, no explanation, only the JSON.`;
 
@@ -163,28 +193,75 @@ function parseCleanJson(raw: string, fallbackText: string): ParsedSiteUpdate {
   }
 }
 
+const KNOWN_SPACES = [
+  'GARBAGE ROOM', 'GARBAGE CHUTE', 'POD TOILET', 'MALE TOILET', 'FEMALE TOILET', 'TOILET',
+  '2.40 M SERVICE CORRIDOR', 'CORRIDOR', 'JANITOR', 'STORE ROOM', 'FM OFFICE & STORE',
+  'FM OFFICE PANTRY', 'AHU ROOM', 'ELEC. ROOM', 'ELEC. CABINET', 'ELV. RM.',
+  'SERVICE LIFT LOBBY', 'LIFT LOBBY', 'STAIRCASE', 'AUDITORIUM', 'PRODUCTION ROOM',
+  'CCU ROOM', 'GENERATOR ROOM', 'IDF RM', 'SERVER ROOM', 'KITCHEN', 'PANTRY', 'MEP'
+];
+
 function fallbackHeuristicParser(text: string): ParsedSiteUpdate {
   const upper = text.toUpperCase();
 
-  // Try to match level (e.g. L2, LEVEL 2, FLOOR 2)
+  // 1. Match Level (e.g. L2, LEVEL 2, FLOOR 2)
   const levelMatch = upper.match(/(?:L|LEVEL|FLOOR)\s*(\d)/i);
   const level = levelMatch ? parseInt(levelMatch[1], 10) : null;
 
-  // Try to match zone (e.g. Z1, ZONE 2)
+  // 2. Match Zone (e.g. Z1, ZONE 2)
   const zoneMatch = upper.match(/(?:Z|ZONE)\s*(\d)/i);
   const zone = zoneMatch ? parseInt(zoneMatch[1], 10) : null;
 
-  // Try to match room number (e.g. ROOM 204, R204, 204)
-  const roomMatch = upper.match(/(?:ROOM|R|SPACE)?\s*([A-Z]?\d{3}[A-Z]?)/i);
-  const spaceNo = roomMatch ? roomMatch[1] : null;
+  // 3. Match Space Name (from known spaces list)
+  let space: string | null = null;
+  for (const s of KNOWN_SPACES) {
+    if (upper.includes(s)) {
+      space = s;
+      break;
+    }
+  }
 
-  // Try to match status
+  // 4. Match explicit numeric room number (e.g. ROOM 204, R102, #204)
+  // Only if digits are present, avoiding words like "ROOM" alone
+  let spaceNo: string | null = null;
+  const roomMatch = upper.match(/\b(?:ROOM|R|#)\s*([A-Z0-9-]*\d+[A-Z0-9-]*)\b/i) ||
+                    upper.match(/\b([A-Z]?\d{3}[A-Z]?)\b/i);
+  if (roomMatch && /\d/.test(roomMatch[1])) {
+    spaceNo = roomMatch[1].toUpperCase();
+  }
+
+  // If no specific space name was matched, fall back to spaceNo or 'SITE'
+  if (!space) {
+    space = spaceNo ? `ROOM ${spaceNo}` : 'SITE';
+  }
+
+  // 5. Match finish and finish code
+  let finishCode: string | null = null;
+  let finishKind: 'Floor' | 'Skirting' | 'Wall' | 'Ceiling' | null = null;
+  if (/SCREED/i.test(upper)) {
+    finishCode = 'F02';
+    finishKind = 'Floor';
+  } else if (/PAINT/i.test(upper)) {
+    finishCode = 'W04';
+    finishKind = 'Wall';
+  } else if (/PLASTER/i.test(upper)) {
+    finishCode = 'W02';
+    finishKind = 'Wall';
+  } else if (/TILE|TILES|TILING/i.test(upper)) {
+    finishCode = 'F08';
+    finishKind = 'Floor';
+  } else if (/CEILING/i.test(upper)) {
+    finishCode = 'C03';
+    finishKind = 'Ceiling';
+  }
+
+  // 6. Match status
   let status: 'pending' | 'ongoing' | 'done' | null = null;
   if (/DONE|COMPLETE|COMPLETED|FINISHED/i.test(upper)) status = 'done';
   else if (/ONGOING|IN PROGRESS|STARTED|PROGRESS/i.test(upper)) status = 'ongoing';
   else if (/PENDING|NOT STARTED/i.test(upper)) status = 'pending';
 
-  // Check for snag keyword
+  // 7. Check for snag keyword
   let snag: { text: string; trade: string } | null = null;
   if (/SNAG|DEFECT|ISSUE|CRACK|LEAK|DAMAGE/i.test(upper)) {
     snag = {
@@ -193,17 +270,19 @@ function fallbackHeuristicParser(text: string): ParsedSiteUpdate {
     };
   }
 
+  const spaceTitle = spaceNo ? `${space} (Room ${spaceNo})` : space;
+
   return {
     level,
     zone,
-    space: spaceNo || 'SITE',
+    space,
     spaceNo,
     spaceCode: spaceNo,
-    finishCode: null,
-    finishKind: null,
+    finishCode,
+    finishKind,
     status,
     snag,
     notes: text,
-    summary: `Update for ${spaceNo ? 'Room ' + spaceNo : 'site space'}${status ? ` (${status})` : ''}`
+    summary: `Update for ${spaceTitle}${status ? ` (${status})` : ''}`
   };
 }

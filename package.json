@@ -4,6 +4,7 @@
   "description": "Telegram bot Cloudflare Worker for ECIT site progress tracking with AI analysis and Supabase integration",
   "main": "src/index.ts",
   "scripts": {
+    "build": "echo 'build ok'",
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "typecheck": "tsc --noEmit"

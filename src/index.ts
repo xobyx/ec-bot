@@ -154,7 +154,14 @@ async function handleMessage(message: any, env: Env): Promise<void> {
 
     // Build human-friendly Confirmation Card
     const levelStr = typeof parsed.level === 'number' ? `Level ${parsed.level}` : 'Unspecified Level';
-    const spaceStr = parsed.spaceNo ? `Room ${parsed.spaceNo}` : (parsed.space || 'General Site');
+    const zoneStr = typeof parsed.zone === 'number' && parsed.zone > 0 ? `Zone ${parsed.zone}` : (parsed.zone === 0 ? 'All Zones' : '');
+    const spaceName = parsed.space && parsed.space !== 'SITE' ? parsed.space : '';
+    const roomNumber = parsed.spaceNo ? `Room ${parsed.spaceNo}` : '';
+
+    // Build clear location string: e.g. "Level 1 | Zone 2 | GARBAGE ROOM"
+    const locationParts = [levelStr, zoneStr, spaceName, roomNumber].filter(Boolean);
+    const locationText = locationParts.join(' | ');
+
     const finishStr = parsed.finishCode
       ? `• *Finish:* \`${parsed.finishCode}\` ➔ *${(parsed.status || 'updated').toUpperCase()}*\n`
       : (parsed.status ? `• *Status:* *${parsed.status.toUpperCase()}*\n` : '');
@@ -166,7 +173,7 @@ async function handleMessage(message: any, env: Env): Promise<void> {
 
     const confirmationText =
       `📋 *Proposed Room Update*\n\n` +
-      `• *Location:* *${levelStr}* | *${spaceStr}*\n` +
+      `• *Location:* *${locationText}*\n` +
       finishStr +
       snagStr +
       photoStr +
