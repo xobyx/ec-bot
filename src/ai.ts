@@ -171,12 +171,18 @@ function parseCleanJson(raw: string, fallbackText: string): ParsedSiteUpdate {
     const cleaned = raw.replace(/^```json/im, '').replace(/^```/im, '').replace(/```$/m, '').trim();
     const parsed = JSON.parse(cleaned);
 
+    let cleanSpaceNo = parsed.spaceNo ? String(parsed.spaceNo).trim() : null;
+    // Discard spaceNo if it's accidentally a Zone (Z1..Z4) or Level (L0..L8)
+    if (cleanSpaceNo && /^[ZL]\d$/i.test(cleanSpaceNo)) {
+      cleanSpaceNo = null;
+    }
+
     return {
       level: typeof parsed.level === 'number' ? parsed.level : null,
       zone: typeof parsed.zone === 'number' ? parsed.zone : null,
       space: parsed.space || null,
-      spaceNo: parsed.spaceNo || null,
-      spaceCode: parsed.spaceCode || null,
+      spaceNo: cleanSpaceNo,
+      spaceCode: cleanSpaceNo,
       finishCode: parsed.finishCode ? String(parsed.finishCode).toUpperCase() : null,
       finishKind: parsed.finishKind || null,
       status: ['pending', 'ongoing', 'done'].includes(parsed.status) ? parsed.status : null,
@@ -222,12 +228,16 @@ function fallbackHeuristicParser(text: string): ParsedSiteUpdate {
   }
 
   // 4. Match explicit numeric room number (e.g. ROOM 204, R102, #204)
-  // Only if digits are present, avoiding words like "ROOM" alone
+  // Only if digits are present, avoiding words like "ROOM" alone or zone tags (Z1, Z2)
   let spaceNo: string | null = null;
-  const roomMatch = upper.match(/\b(?:ROOM|R|#)\s*([A-Z0-9-]*\d+[A-Z0-9-]*)\b/i) ||
-                    upper.match(/\b([A-Z]?\d{3}[A-Z]?)\b/i);
+  const textWithoutSpace = space ? upper.replace(space, '') : upper;
+  const roomMatch = textWithoutSpace.match(/\b(?:ROOM|R|#)\s*([A-Z0-9-]*\d+[A-Z0-9-]*)\b/i) ||
+                    textWithoutSpace.match(/\b([A-Z]?\d{3}[A-Z]?)\b/i);
   if (roomMatch && /\d/.test(roomMatch[1])) {
-    spaceNo = roomMatch[1].toUpperCase();
+    const cand = roomMatch[1].toUpperCase();
+    if (!/^[ZL]\d$/i.test(cand) && !/^ZONE/i.test(cand) && !/^LEVEL/i.test(cand)) {
+      spaceNo = cand;
+    }
   }
 
   // If no specific space name was matched, fall back to spaceNo or 'SITE'

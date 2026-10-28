@@ -156,7 +156,7 @@ async function handleMessage(message: any, env: Env): Promise<void> {
     const levelStr = typeof parsed.level === 'number' ? `Level ${parsed.level}` : 'Unspecified Level';
     const zoneStr = typeof parsed.zone === 'number' && parsed.zone > 0 ? `Zone ${parsed.zone}` : (parsed.zone === 0 ? 'All Zones' : '');
     const spaceName = parsed.space && parsed.space !== 'SITE' ? parsed.space : '';
-    const roomNumber = parsed.spaceNo ? `Room ${parsed.spaceNo}` : '';
+    const roomNumber = (parsed.spaceNo && !spaceName.includes(parsed.spaceNo)) ? `Room ${parsed.spaceNo}` : '';
 
     // Build clear location string: e.g. "Level 1 | Zone 2 | GARBAGE ROOM"
     const locationParts = [levelStr, zoneStr, spaceName, roomNumber].filter(Boolean);
