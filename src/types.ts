@@ -87,13 +87,25 @@ export interface ParsedSiteUpdate {
   summary: string;
 }
 
+export type BotUiMode =
+  | 'auto'
+  | 'confirm'
+  | 'pick_level'
+  | 'pick_zone'
+  | 'pick_room'
+  | 'pick_finish';
+
 export interface PendingAction {
   id: string;
   chatId: number;
   telegramUserId: number;
   telegramUsername?: string;
   parsed: ParsedSiteUpdate;
+  selectedRoomId?: string;
+  uiMode?: BotUiMode;
+  roomPage?: number;
   photoFileId?: string;
+  uploadedPhotoId?: string;
   createdAt: string;
 }
 

@@ -24,7 +24,22 @@ export async function sendMessage(
       reply_to_message_id: options.reply_to_message_id
     })
   });
-  return await res.json();
+  const data: any = await res.json();
+  // Fallback without parse_mode if unescaped Markdown symbols caused a 400 error
+  if (!data.ok && options.parse_mode !== undefined) {
+    const fallbackRes = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text: text.replace(/[*_`]/g, ''),
+        reply_markup: options.reply_markup,
+        reply_to_message_id: options.reply_to_message_id
+      })
+    });
+    return await fallbackRes.json();
+  }
+  return data;
 }
 
 export async function editMessageText(
@@ -45,6 +60,45 @@ export async function editMessageText(
       chat_id: chatId,
       message_id: messageId,
       text,
+      parse_mode: options.parse_mode ?? 'Markdown',
+      reply_markup: options.reply_markup
+    })
+  });
+  const data: any = await res.json();
+  if (!data.ok && data.description?.includes("can't parse entities")) {
+    const fallbackRes = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: chatId,
+        message_id: messageId,
+        text: text.replace(/[*_`]/g, ''),
+        reply_markup: options.reply_markup
+      })
+    });
+    return await fallbackRes.json();
+  }
+  return data;
+}
+
+export async function sendPhoto(
+  botToken: string,
+  chatId: number | string,
+  photo: string,
+  caption?: string,
+  options: {
+    parse_mode?: 'Markdown' | 'HTML';
+    reply_markup?: TelegramInlineKeyboardMarkup;
+  } = {}
+): Promise<any> {
+  const url = `${TELEGRAM_API_BASE}/bot${botToken}/sendPhoto`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      chat_id: chatId,
+      photo,
+      caption,
       parse_mode: options.parse_mode ?? 'Markdown',
       reply_markup: options.reply_markup
     })

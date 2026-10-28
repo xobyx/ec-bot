@@ -4,13 +4,17 @@ const SYSTEM_PROMPT = `You are an expert AI site engineer assistant for the ECIT
 Your job is to analyze site messages and photos submitted by site engineers via Telegram, and extract structured progress updates, finishes, and snags (defects).
 
 Project details:
-- Levels: 0 (Ground), 1 (1st), 2 (2nd), 3 (3rd), 4 (4th), 5 (5th), 6 (6th), 7 (7th), 8 (8th).
-- Zones: 1, 2, 3, 4, or 0 (all zones). If message mentions "zone 2" or "z2", zone MUST be 2.
+- Levels: 0 (Ground Floor / GF), 1 (1st / F1 / L1), 2 (2nd / F2 / L2), 3 (3rd / F3 / L3), 4 (4th / F4 / L4), 5 (5th / F5 / L5), 6 (6th / F6 / L6), 7 (7th / F7 / L7), 8 (8th / F8 / L8).
+  If level is NOT mentioned and cannot be inferred from a room code like GF-008 or F4-041, level MUST be null.
+- Zones: 1, 2, 3, 4, or 0 (all zones). If message mentions "zone 2" or "z2", zone MUST be 2. If zone is NOT mentioned, zone MUST be null.
+- Room Codes (spaceCode): Often formatted like "GF-008", "F1-021", "F4-041".
+  - "GF-xxx" implies level = 0.
+  - "F1-xxx" implies level = 1, "F4-xxx" implies level = 4, etc.
 - Known Space Names:
   GARBAGE ROOM, GARBAGE CHUTE, POD TOILET, MALE TOILET, FEMALE TOILET, TOILET, CORRIDOR, 2.40 M SERVICE CORRIDOR,
   JANITOR, STORE ROOM, FM OFFICE & STORE, FM OFFICE PANTRY, AHU ROOM, ELEC. ROOM, ELEC. CABINET, ELV. RM.,
   LIFT LOBBY, SERVICE LIFT LOBBY, STAIRCASE, AUDITORIUM, PRODUCTION ROOM, CCU ROOM, GENERATOR ROOM,
-  IDF RM, SERVER ROOM, KITCHEN, PANTRY, MEP, SHAFT, P.SHAFT, F.H.R., OFFICE SPACE.
+  IDF RM, SERVER ROOM, KITCHEN, PANTRY, MEP, MEP SHAFT, SHAFT, P.SHAFT, F.H.R., OFFICE SPACE.
 
 - Finish Categories and common codes:
   * Floor (F):
@@ -34,14 +38,13 @@ Project details:
   * Skirting (S): S01-S13.
 
 - Status values must be strictly: "pending", "ongoing", "done", or null if not mentioned.
-- Snag trades: "Painting", "Plastering", "Tiling", "Flooring", "Ceiling", "MEP", "Electrical", "Plumbing", "HVAC", "Carpentry", "Civil", "Cleaning", "General".
+- Snag trades: "Paint", "Plaster", "Tile", "Floor", "Ceiling", "MEP", "Civil", "Joinery", "Glazing", "General".
 
 CRITICAL EXTRACTION RULES:
-1. "space": Put the uppercase Space Name here (e.g. "GARBAGE ROOM", "POD TOILET", "CORRIDOR").
-2. "spaceNo": ONLY fill this if the user EXPLICITLY wrote a room number (e.g. "204", "105", "G-01").
-   If the user only named the space (e.g. "garbage room", "toilet"), spaceNo MUST BE null! DO NOT INVENT A ROOM NUMBER.
-3. "zone": Extract the zone number (1, 2, 3, 4). If the user mentions "zone 2", zone MUST BE 2.
-4. "finishCode": If user mentions "screed" in a service area, garbage room, or corridor, map to "F02".
+1. "level": Extract level number (0..8) ONLY if mentioned or inferred from room code (e.g. GF-008 -> 0, F4-041 -> 4). Otherwise null!
+2. "zone": Extract zone number (1..4, or 0 if "all zones") ONLY if mentioned. Otherwise null!
+3. "space": Put the uppercase Space Name here (e.g. "GARBAGE ROOM", "POD TOILET", "CORRIDOR", "MEP SHAFT"). If not mentioned, null!
+4. "spaceCode" / "spaceNo": Put explicit room code (e.g. "GF-008", "F4-041", "204") ONLY if explicitly written. Never invent a room number!
 
 You MUST return ONLY a valid JSON object with the following schema:
 {
@@ -67,7 +70,6 @@ export async function analyzeSiteUpdate(
   text: string,
   imageBytes?: Uint8Array
 ): Promise<ParsedSiteUpdate> {
-  // If user provided GEMINI_API_KEY, use Gemini Flash
   if (env.GEMINI_API_KEY) {
     try {
       return await analyzeWithGemini(env.GEMINI_API_KEY, text, imageBytes);
@@ -76,7 +78,6 @@ export async function analyzeSiteUpdate(
     }
   }
 
-  // Otherwise, use Cloudflare Workers AI
   return await analyzeWithWorkersAI(env.AI, text, imageBytes);
 }
 
@@ -85,13 +86,11 @@ async function analyzeWithWorkersAI(
   text: string,
   imageBytes?: Uint8Array
 ): Promise<ParsedSiteUpdate> {
-  let promptText = `User message: "${text || 'Please inspect attached site photo'}"`;
+  const promptText = `User message: "${text || 'Please inspect attached site photo'}"`;
 
   try {
     let result: any;
     if (imageBytes && imageBytes.length > 0) {
-      // Use Llama 3.2 Vision on Cloudflare Workers AI
-      // Convert image bytes to number array for Cloudflare Workers AI vision input
       const imageArray = [...imageBytes];
       result = await ai.run('@cf/meta/llama-3.2-11b-vision-instruct', {
         prompt: `${SYSTEM_PROMPT}\n\n${promptText}`,
@@ -99,7 +98,6 @@ async function analyzeWithWorkersAI(
         max_tokens: 512
       });
     } else {
-      // Text-only model
       result = await ai.run('@cf/meta/llama-3.2-3b-instruct', {
         messages: [
           { role: 'system', content: SYSTEM_PROMPT },
@@ -113,7 +111,6 @@ async function analyzeWithWorkersAI(
     return parseCleanJson(responseText, text);
   } catch (err: any) {
     console.error('Workers AI execution error:', err);
-    // Fallback heuristic parser if AI temporarily fails
     return fallbackHeuristicParser(text);
   }
 }
@@ -129,7 +126,6 @@ async function analyzeWithGemini(
   parts.push({ text: `${SYSTEM_PROMPT}\n\nAnalyze this site update: "${text || 'Please inspect photo'}"` });
 
   if (imageBytes && imageBytes.length > 0) {
-    // Convert Uint8Array to base64
     let binary = '';
     const len = imageBytes.byteLength;
     for (let i = 0; i < len; i++) {
@@ -170,28 +166,53 @@ function parseCleanJson(raw: string, fallbackText: string): ParsedSiteUpdate {
   try {
     const cleaned = raw.replace(/^```json/im, '').replace(/^```/im, '').replace(/```$/m, '').trim();
     const parsed = JSON.parse(cleaned);
+    const heuristic = fallbackHeuristicParser(fallbackText);
 
-    let cleanSpaceNo = parsed.spaceNo ? String(parsed.spaceNo).trim() : null;
-    // Discard spaceNo if it's accidentally a Zone (Z1..Z4) or Level (L0..L8)
-    if (cleanSpaceNo && /^[ZL]\d$/i.test(cleanSpaceNo)) {
-      cleanSpaceNo = null;
+    let cleanSpaceCode = (parsed.spaceCode || parsed.spaceNo || heuristic.spaceCode || '')
+      .toString()
+      .trim()
+      .toUpperCase() || null;
+
+    if (cleanSpaceCode && /^[ZL]\d$/i.test(cleanSpaceCode)) {
+      cleanSpaceCode = null;
     }
 
+    let level: number | null = typeof parsed.level === 'number' ? parsed.level : heuristic.level;
+    const zone: number | null = typeof parsed.zone === 'number' ? parsed.zone : heuristic.zone;
+
+    // Infer level from schedule code like GF-008 or F4-041 if level is still null
+    if (level === null && cleanSpaceCode) {
+      if (/^GF-\d+/i.test(cleanSpaceCode)) level = 0;
+      else {
+        const m = cleanSpaceCode.match(/^F(\d)-\d+/i);
+        if (m) level = parseInt(m[1], 10);
+      }
+    }
+
+    const space = (parsed.space && parsed.space !== 'SITE' ? String(parsed.space).toUpperCase() : null) || heuristic.space;
+    const finishCode = (parsed.finishCode ? String(parsed.finishCode).toUpperCase() : null) || heuristic.finishCode;
+    const status = ['pending', 'ongoing', 'done'].includes(parsed.status)
+      ? parsed.status
+      : heuristic.status;
+
     return {
-      level: typeof parsed.level === 'number' ? parsed.level : null,
-      zone: typeof parsed.zone === 'number' ? parsed.zone : null,
-      space: parsed.space || null,
-      spaceNo: cleanSpaceNo,
-      spaceCode: cleanSpaceNo,
-      finishCode: parsed.finishCode ? String(parsed.finishCode).toUpperCase() : null,
-      finishKind: parsed.finishKind || null,
-      status: ['pending', 'ongoing', 'done'].includes(parsed.status) ? parsed.status : null,
-      snag: parsed.snag && parsed.snag.text ? {
-        text: String(parsed.snag.text),
-        trade: parsed.snag.trade || 'General'
-      } : null,
+      level,
+      zone,
+      space,
+      spaceNo: cleanSpaceCode,
+      spaceCode: cleanSpaceCode,
+      finishCode,
+      finishKind: parsed.finishKind || heuristic.finishKind || null,
+      status,
+      snag:
+        parsed.snag && parsed.snag.text
+          ? {
+              text: String(parsed.snag.text),
+              trade: parsed.snag.trade || 'General'
+            }
+          : heuristic.snag,
       notes: parsed.notes || fallbackText,
-      summary: parsed.summary || 'Site update parsed'
+      summary: parsed.summary || heuristic.summary || 'Site update parsed'
     };
   } catch (e) {
     console.error('Failed to parse AI JSON:', raw, e);
@@ -200,25 +221,53 @@ function parseCleanJson(raw: string, fallbackText: string): ParsedSiteUpdate {
 }
 
 const KNOWN_SPACES = [
+  '2.40 M SERVICE CORRIDOR', 'SERVICE LIFT LOBBY', 'FM OFFICE & STORE', 'FM OFFICE PANTRY',
   'GARBAGE ROOM', 'GARBAGE CHUTE', 'POD TOILET', 'MALE TOILET', 'FEMALE TOILET', 'TOILET',
-  '2.40 M SERVICE CORRIDOR', 'CORRIDOR', 'JANITOR', 'STORE ROOM', 'FM OFFICE & STORE',
-  'FM OFFICE PANTRY', 'AHU ROOM', 'ELEC. ROOM', 'ELEC. CABINET', 'ELV. RM.',
-  'SERVICE LIFT LOBBY', 'LIFT LOBBY', 'STAIRCASE', 'AUDITORIUM', 'PRODUCTION ROOM',
-  'CCU ROOM', 'GENERATOR ROOM', 'IDF RM', 'SERVER ROOM', 'KITCHEN', 'PANTRY', 'MEP'
+  'CORRIDOR', 'JANITOR', 'STORE ROOM', 'AHU ROOM', 'ELEC. ROOM', 'ELEC. CABINET', 'ELV. RM.',
+  'LIFT LOBBY', 'STAIRCASE', 'AUDITORIUM', 'PRODUCTION ROOM', 'CCU ROOM', 'GENERATOR ROOM',
+  'IDF RM', 'SERVER ROOM', 'KITCHEN', 'PANTRY', 'MEP SHAFT', 'MEP', 'P.SHAFT', 'SHAFT', 'F.H.R.'
 ];
 
-function fallbackHeuristicParser(text: string): ParsedSiteUpdate {
-  const upper = text.toUpperCase();
+export function fallbackHeuristicParser(text: string): ParsedSiteUpdate {
+  const upper = (text || '').toUpperCase();
 
-  // 1. Match Level (e.g. L2, LEVEL 2, FLOOR 2)
-  const levelMatch = upper.match(/(?:L|LEVEL|FLOOR)\s*(\d)/i);
-  const level = levelMatch ? parseInt(levelMatch[1], 10) : null;
+  // 1. Match explicit Room Code like GF-008, F1-021, F4-041
+  let spaceCode: string | null = null;
+  const schedCodeMatch = upper.match(/\b(GF-\d{2,4}|F\d-\d{2,4})\b/i);
+  if (schedCodeMatch) {
+    spaceCode = schedCodeMatch[1].toUpperCase();
+  }
 
-  // 2. Match Zone (e.g. Z1, ZONE 2)
-  const zoneMatch = upper.match(/(?:Z|ZONE)\s*(\d)/i);
-  const zone = zoneMatch ? parseInt(zoneMatch[1], 10) : null;
+  // 2. Match Level (e.g. GF, GROUND FLOOR, L2, LEVEL 2, FLOOR 2)
+  let level: number | null = null;
+  if (/\b(?:GF|GROUND\s*FLOOR|LEVEL\s*0|L0)\b/i.test(upper)) {
+    level = 0;
+  } else {
+    const levelMatch = upper.match(/\b(?:L|LEVEL|FLOOR|F)\s*([0-8])\b/i);
+    if (levelMatch) {
+      level = parseInt(levelMatch[1], 10);
+    }
+  }
+  if (level === null && spaceCode) {
+    if (spaceCode.startsWith('GF-')) level = 0;
+    else {
+      const m = spaceCode.match(/^F(\d)-/);
+      if (m) level = parseInt(m[1], 10);
+    }
+  }
 
-  // 3. Match Space Name (from known spaces list)
+  // 3. Match Zone (e.g. Z1, ZONE 2, ALL ZONES)
+  let zone: number | null = null;
+  if (/\bALL\s*ZONES?\b/i.test(upper)) {
+    zone = 0;
+  } else {
+    const zoneMatch = upper.match(/\b(?:Z|ZONE)\s*([1-4])\b/i);
+    if (zoneMatch) {
+      zone = parseInt(zoneMatch[1], 10);
+    }
+  }
+
+  // 4. Match Space Name
   let space: string | null = null;
   for (const s of KNOWN_SPACES) {
     if (upper.includes(s)) {
@@ -227,29 +276,32 @@ function fallbackHeuristicParser(text: string): ParsedSiteUpdate {
     }
   }
 
-  // 4. Match explicit numeric room number (e.g. ROOM 204, R102, #204)
-  // Only if digits are present, avoiding words like "ROOM" alone or zone tags (Z1, Z2)
-  let spaceNo: string | null = null;
-  const textWithoutSpace = space ? upper.replace(space, '') : upper;
-  const roomMatch = textWithoutSpace.match(/\b(?:ROOM|R|#)\s*([A-Z0-9-]*\d+[A-Z0-9-]*)\b/i) ||
-                    textWithoutSpace.match(/\b([A-Z]?\d{3}[A-Z]?)\b/i);
-  if (roomMatch && /\d/.test(roomMatch[1])) {
-    const cand = roomMatch[1].toUpperCase();
-    if (!/^[ZL]\d$/i.test(cand) && !/^ZONE/i.test(cand) && !/^LEVEL/i.test(cand)) {
-      spaceNo = cand;
+  // 5. Match explicit room number if no schedule code yet
+  if (!spaceCode) {
+    const textWithoutSpace = space ? upper.replace(space, '') : upper;
+    const roomMatch = textWithoutSpace.match(/\b(?:ROOM|RM|R|#)\s*([A-Z0-9-]*\d+[A-Z0-9-]*)\b/i);
+    if (roomMatch && /\d/.test(roomMatch[1])) {
+      const cand = roomMatch[1].toUpperCase();
+      if (!/^[ZLF]\d$/i.test(cand)) {
+        spaceCode = cand;
+      }
     }
   }
 
-  // If no specific space name was matched, fall back to spaceNo or 'SITE'
-  if (!space) {
-    space = spaceNo ? `ROOM ${spaceNo}` : 'SITE';
-  }
-
-  // 5. Match finish and finish code
+  // 6. Match explicit finish code (e.g. F02, W04, W05A, C07, S02) or keyword
   let finishCode: string | null = null;
   let finishKind: 'Floor' | 'Skirting' | 'Wall' | 'Ceiling' | null = null;
-  if (/SCREED/i.test(upper)) {
+
+  const explicitFinish = upper.match(/\b([FWCS]\d{2}[A-Z]?)\b/);
+  if (explicitFinish) {
+    finishCode = explicitFinish[1];
+    const p = finishCode[0];
+    finishKind = p === 'F' ? 'Floor' : p === 'W' ? 'Wall' : p === 'C' ? 'Ceiling' : 'Skirting';
+  } else if (/SCREED/i.test(upper)) {
     finishCode = 'F02';
+    finishKind = 'Floor';
+  } else if (/EPOXY/i.test(upper)) {
+    finishCode = 'F06';
     finishKind = 'Floor';
   } else if (/PAINT/i.test(upper)) {
     finishCode = 'W04';
@@ -260,39 +312,48 @@ function fallbackHeuristicParser(text: string): ParsedSiteUpdate {
   } else if (/TILE|TILES|TILING/i.test(upper)) {
     finishCode = 'F08';
     finishKind = 'Floor';
-  } else if (/CEILING/i.test(upper)) {
+  } else if (/CEILING|GYPSUM|GRID/i.test(upper)) {
     finishCode = 'C03';
     finishKind = 'Ceiling';
+  } else if (/SKIRT/i.test(upper)) {
+    finishCode = 'S01';
+    finishKind = 'Skirting';
   }
 
-  // 6. Match status
+  // 7. Match status
   let status: 'pending' | 'ongoing' | 'done' | null = null;
-  if (/DONE|COMPLETE|COMPLETED|FINISHED/i.test(upper)) status = 'done';
-  else if (/ONGOING|IN PROGRESS|STARTED|PROGRESS/i.test(upper)) status = 'ongoing';
-  else if (/PENDING|NOT STARTED/i.test(upper)) status = 'pending';
+  if (/\b(?:DONE|COMPLETE|COMPLETED|FINISHED|PASSED)\b/i.test(upper)) status = 'done';
+  else if (/\b(?:ONGOING|IN\s*PROGRESS|STARTED|PROGRESS|WORKING)\b/i.test(upper)) status = 'ongoing';
+  else if (/\b(?:PENDING|NOT\s*STARTED|HOLD)\b/i.test(upper)) status = 'pending';
 
-  // 7. Check for snag keyword
+  // 8. Check for snag keyword
   let snag: { text: string; trade: string } | null = null;
-  if (/SNAG|DEFECT|ISSUE|CRACK|LEAK|DAMAGE/i.test(upper)) {
+  if (/\b(?:SNAG|DEFECT|ISSUE|CRACK|LEAK|DAMAGE|LIPPAGE|SCRATCH)\b/i.test(upper)) {
+    let trade = 'General';
+    if (/TILE|GROUT|LIPPAGE/i.test(upper)) trade = 'Tile';
+    else if (/PAINT|COAT/i.test(upper)) trade = 'Paint';
+    else if (/PLASTER|CRACK/i.test(upper)) trade = 'Civil';
+    else if (/CEILING|GRID/i.test(upper)) trade = 'Ceiling';
+    else if (/PIPE|LEAK|DUCT|CABLE|MEP/i.test(upper)) trade = 'MEP';
     snag = {
-      text: text,
-      trade: 'General'
+      text: text.replace(/^snag\s*[:\-]?\s*/i, '').trim() || text,
+      trade
     };
   }
 
-  const spaceTitle = spaceNo ? `${space} (Room ${spaceNo})` : space;
+  const spaceTitle = spaceCode ? `${space || 'Room'} (${spaceCode})` : space || 'Room';
 
   return {
     level,
     zone,
     space,
-    spaceNo,
-    spaceCode: spaceNo,
+    spaceNo: spaceCode,
+    spaceCode,
     finishCode,
     finishKind,
     status,
     snag,
     notes: text,
-    summary: `Update for ${spaceTitle}${status ? ` (${status})` : ''}`
+    summary: `${spaceTitle}${finishCode ? ` ${finishCode}` : ''}${status ? ` → ${status.toUpperCase()}` : ''}`
   };
 }
