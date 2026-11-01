@@ -34,7 +34,11 @@ import {
   closeRoomSnag,
   getProjectStats,
   getRoomsWithOpenSnags,
-  formatRoomTitle
+  formatRoomTitle,
+  finishCompactName,
+  finishShortDesc,
+  formatFinishButton,
+  formatFinishLine
 } from './supabase';
 
 const WEB_APP_BASE = 'https://ecit-tracker.pages.dev';
@@ -443,7 +447,9 @@ function buildRoomDashboardCard(room: Room): { text: string; keyboard: TelegramI
   const title = formatRoomTitle(room);
   const checkEntries = Object.entries(room.checks || {});
   const checksLines = checkEntries.length
-    ? checkEntries.map(([c, st]) => `  ${statusEmoji(st)} \`${c}\`: *${st.toUpperCase()}*`).join('\n')
+    ? checkEntries
+        .map(([c, st]) => `  ${statusEmoji(st)} \`${c}\` · ${finishShortDesc(c)} — *${st.toUpperCase()}*`)
+        .join('\n')
     : '  _No finishes assigned_';
 
   const openSnags = (room.snags || []).filter(s => s.status === 'open');
@@ -466,18 +472,18 @@ function buildRoomDashboardCard(room: Room): { text: string; keyboard: TelegramI
     (room.notes ? `\n📝 *Notes:* _${room.notes}_\n` : '') +
     `📸 *Stored Photos:* ${(room.photos || []).length}` +
     (logLines ? `\n\n🕒 *Recent Activity:*\n${logLines}` : '') +
-    `\n\n💡 _Tap any finish code below to cycle status (Pending ➔ Ongoing ➔ Done), or reply to this message with a photo/note!_`;
+    `\n\n💡 _Tap any finish below to cycle status (Pending ➔ Ongoing ➔ Done), or reply to this message with a photo/note!_`;
 
   const rows: TelegramInlineKeyboardButton[][] = [];
 
-  // 1-Tap Finish Toggle buttons
+  // 1-Tap Finish Toggle buttons (2 per row so short names fit cleanly)
   if (checkEntries.length > 0) {
     const btns: TelegramInlineKeyboardButton[] = checkEntries.slice(0, 8).map(([code, st]) => ({
-      text: `${statusEmoji(st)} ${code}`,
+      text: formatFinishButton(code, `${statusEmoji(st)} `),
       callback_data: `qfin:${room.id}:${code}`
     }));
-    for (let i = 0; i < btns.length; i += 4) {
-      rows.push(btns.slice(i, i + 4));
+    for (let i = 0; i < btns.length; i += 2) {
+      rows.push(btns.slice(i, i + 2));
     }
   }
 
@@ -690,7 +696,7 @@ async function buildInteractivePrompt(
       `🏢 *Select Level (Floor)*\n\n` +
       `• *Detected Space:* ${parsed.spaceCode || parsed.space || 'Unspecified'}\n` +
       (parsed.finishCode
-        ? `• *Finish:* \`${parsed.finishCode}\` ${parsed.status ? `➔ *${parsed.status.toUpperCase()}*` : ''}\n`
+        ? `• *Finish:* ${formatFinishLine(parsed.finishCode)} ${parsed.status ? `➔ *${parsed.status.toUpperCase()}*` : ''}\n`
         : '') +
       snagLine +
       photoLine +
@@ -725,7 +731,7 @@ async function buildInteractivePrompt(
       `• *Level:* *${levelStr}*\n` +
       `• *Detected Space:* ${parsed.spaceCode || parsed.space || 'Unspecified'}\n` +
       (parsed.finishCode
-        ? `• *Finish:* \`${parsed.finishCode}\` ${parsed.status ? `➔ *${parsed.status.toUpperCase()}*` : ''}\n`
+        ? `• *Finish:* ${formatFinishLine(parsed.finishCode)} ${parsed.status ? `➔ *${parsed.status.toUpperCase()}*` : ''}\n`
         : '') +
       snagLine +
       photoLine +
@@ -769,7 +775,7 @@ async function buildInteractivePrompt(
       `🚪 *Select Room (${levelStr} · ${zoneStr})*\n\n` +
       (parsed.space ? `• *Searched Space:* \`${parsed.space}\`\n` : '') +
       (parsed.finishCode
-        ? `• *Finish:* \`${parsed.finishCode}\` ${parsed.status ? `➔ *${parsed.status.toUpperCase()}*` : ''}\n`
+        ? `• *Finish:* ${formatFinishLine(parsed.finishCode)} ${parsed.status ? `➔ *${parsed.status.toUpperCase()}*` : ''}\n`
         : '') +
       snagLine +
       photoLine +
@@ -840,17 +846,19 @@ async function buildInteractivePrompt(
   const roomLabel = formatRoomTitle(room);
   const roomCheckEntries = Object.entries(room.checks || {});
   const checksSummary = roomCheckEntries.length
-    ? roomCheckEntries.map(([c, st]) => `${statusEmoji(st)}${c}`).join(' ')
-    : 'No finishes linked';
+    ? roomCheckEntries
+        .map(([c, st]) => `  ${statusEmoji(st)} \`${c}\` · ${finishCompactName(c)} (*${st.toUpperCase()}*)`)
+        .join('\n')
+    : '  _No finishes linked_';
 
   const finishDisplay = parsed.finishCode
-    ? `\`${parsed.finishCode}\` ➔ *${(parsed.status || 'select status below').toUpperCase()}*${parsed.status === 'done' ? ' _(auto-completes micro-tasks)_' : ''}`
-    : '_Tap a finish code below (optional)_';
+    ? `${formatFinishLine(parsed.finishCode)} ➔ *${(parsed.status || 'select status below').toUpperCase()}*${parsed.status === 'done' ? ' _(auto-completes micro-tasks)_' : ''}`
+    : '_Tap a finish below (optional)_';
 
   const text =
     `📋 *Confirm Room Update*\n\n` +
     `• *Room:* *${roomLabel}*\n` +
-    `• *Current Finishes:* ${checksSummary}\n` +
+    `• *Current Finishes:*\n${checksSummary}\n` +
     `• *Finish Update:* ${finishDisplay}\n` +
     snagLine +
     photoLine +
@@ -859,19 +867,19 @@ async function buildInteractivePrompt(
 
   const keyboardRows: TelegramInlineKeyboardButton[][] = [];
 
-  // Finish code selector rows from the room's actual checks
+  // Finish selector rows from the room's actual checks (2 per row with short names)
   const finishCodes = Object.keys(room.checks || {});
   if (finishCodes.length > 0) {
     const codeButtons: TelegramInlineKeyboardButton[] = finishCodes.slice(0, 7).map(c => ({
-      text: parsed.finishCode === c ? `🎯 ${c}` : c,
+      text: formatFinishButton(c, parsed.finishCode === c ? '🎯 ' : ''),
       callback_data: `sfin:${action.id}:${c}`
     }));
     codeButtons.push({
-      text: parsed.finishCode === 'ALL' ? '🎯 ALL' : 'ALL',
+      text: formatFinishButton('ALL', parsed.finishCode === 'ALL' ? '🎯 ' : ''),
       callback_data: `sfin:${action.id}:ALL`
     });
-    for (let i = 0; i < codeButtons.length; i += 4) {
-      keyboardRows.push(codeButtons.slice(i, i + 4));
+    for (let i = 0; i < codeButtons.length; i += 2) {
+      keyboardRows.push(codeButtons.slice(i, i + 2));
     }
   }
 
@@ -1001,7 +1009,11 @@ async function handleCallbackQuery(query: any, env: Env): Promise<void> {
     const finishCode = value;
     const updated = await quickCycleRoomFinish(env, roomId, finishCode, authorName);
     if (updated && chatId && messageId) {
-      await answerCallbackQuery(token, query.id, `${finishCode} → ${updated.nextStatus.toUpperCase()}`);
+      await answerCallbackQuery(
+        token,
+        query.id,
+        `${finishCode} (${finishCompactName(finishCode)}) → ${updated.nextStatus.toUpperCase()}`
+      );
       const card = buildRoomDashboardCard(updated.room);
       await editMessageText(token, chatId, messageId, card.text, { reply_markup: card.keyboard });
     } else {
@@ -1155,7 +1167,7 @@ async function handleCallbackQuery(query: any, env: Env): Promise<void> {
       pending.parsed.status = 'done';
     }
     pending.uiMode = 'confirm';
-    await answerCallbackQuery(token, query.id, `Finish ${value}`);
+    await answerCallbackQuery(token, query.id, `${value} · ${finishCompactName(value)}`);
     await updateCardMessage(env, chatId, messageId, pending);
     return;
   }
@@ -1232,7 +1244,7 @@ async function handleCallbackQuery(query: any, env: Env): Promise<void> {
 
       const finishLine =
         result.appliedFinish && pending.parsed.status
-          ? `• *Finish:* \`${result.appliedFinish}\` ➔ *${pending.parsed.status.toUpperCase()}*\n`
+          ? `• *Finish:* ${formatFinishLine(result.appliedFinish)} ➔ *${pending.parsed.status.toUpperCase()}*\n`
           : '';
       const snagLine = pending.parsed.snag
         ? `• *Snag Logged:* "${pending.parsed.snag.text}" (${pending.parsed.snag.trade})\n`
@@ -1322,7 +1334,7 @@ async function sendRoomInspectionAndPhotos(
 
   for (const p of photos) {
     const publicUrl = getPhotoPublicUrl(env, p.id);
-    const caption = `📸 *${title}*\n${p.code ? `Finish: \`${p.code}\` · ` : ''}${p.caption || 'Site photo'}\nID: \`${p.id}\``;
+    const caption = `📸 *${title}*\n${p.code ? `Finish: ${formatFinishLine(p.code)} · ` : ''}${p.caption || 'Site photo'}\nID: \`${p.id}\``;
     await sendPhoto(token, chatId, publicUrl, caption);
   }
 }
