@@ -7,7 +7,7 @@ Project details:
 - Levels: 0 (Ground Floor / GF), 1 (1st / F1 / L1), 2 (2nd / F2 / L2), 3 (3rd / F3 / L3), 4 (4th / F4 / L4), 5 (5th / F5 / L5), 6 (6th / F6 / L6), 7 (7th / F7 / L7), 8 (8th / F8 / L8).
   If level is NOT mentioned and cannot be inferred from a room code like GF-008 or F4-041, level MUST be null.
 - Zones: 1, 2, 3, 4, or 0 (all zones). If message mentions "zone 2" or "z2", zone MUST be 2. If zone is NOT mentioned, zone MUST be null.
-- Room Codes (spaceCode): Often formatted like "GF-008", "F1-021", "F4-041".
+- Room Codes (spaceCode): Often formatted like "GF-008", "F1-021", "F1-040C", "F4-041".
   - "GF-xxx" implies level = 0.
   - "F1-xxx" implies level = 1, "F4-xxx" implies level = 4, etc.
 - Known Space Names:
@@ -19,7 +19,7 @@ Project details:
 - Finish Categories and common codes:
   * Floor (F):
     - F02: Power floated screed with fibres (standard screed in garbage rooms, service corridors, utility rooms, plant rooms)
-    - F03: Screed for vinyl/carpet/tiles (toilets, auditoriums)
+    - F03: Screed for vinyl/carpet/tiles + waterproofing (toilets, wet areas, auditoriums)
     - F06: Epoxy coating
     - F08: Vitrified porcelain tiles
     - F09: Glazed ceramic tiles
@@ -44,7 +44,7 @@ CRITICAL EXTRACTION RULES:
 1. "level": Extract level number (0..8) ONLY if mentioned or inferred from room code (e.g. GF-008 -> 0, F4-041 -> 4). Otherwise null!
 2. "zone": Extract zone number (1..4, or 0 if "all zones") ONLY if mentioned. Otherwise null!
 3. "space": Put the uppercase Space Name here (e.g. "GARBAGE ROOM", "POD TOILET", "CORRIDOR", "MEP SHAFT"). If not mentioned, null!
-4. "spaceCode" / "spaceNo": Put explicit room code (e.g. "GF-008", "F4-041", "204") ONLY if explicitly written. Never invent a room number!
+4. "spaceCode" / "spaceNo": Put explicit room code (e.g. "GF-008", "F1-040C", "F4-041", "204") ONLY if explicitly written. Never invent a room number!
 
 You MUST return ONLY a valid JSON object with the following schema:
 {
@@ -64,6 +64,17 @@ You MUST return ONLY a valid JSON object with the following schema:
   "summary": string
 }
 No markdown fences, no explanation, only the JSON.`;
+
+export function normalizeScheduleCodeInput(raw: string | null | undefined): string | null {
+  if (!raw) return null;
+  const s = String(raw).trim().toUpperCase();
+  if (!s || /^[ZLF]\d$/i.test(s)) return null;
+  const m = s.match(/^(GF|F[1-8])[-\s]?(\d{2,4}[A-Z]?)$/i);
+  if (m) {
+    return `${m[1].toUpperCase()}-${m[2].toUpperCase()}`;
+  }
+  return s;
+}
 
 export async function analyzeSiteUpdate(
   env: Env,
@@ -168,19 +179,13 @@ function parseCleanJson(raw: string, fallbackText: string): ParsedSiteUpdate {
     const parsed = JSON.parse(cleaned);
     const heuristic = fallbackHeuristicParser(fallbackText);
 
-    let cleanSpaceCode = (parsed.spaceCode || parsed.spaceNo || heuristic.spaceCode || '')
-      .toString()
-      .trim()
-      .toUpperCase() || null;
-
-    if (cleanSpaceCode && /^[ZL]\d$/i.test(cleanSpaceCode)) {
-      cleanSpaceCode = null;
-    }
+    const cleanSpaceCode = normalizeScheduleCodeInput(
+      parsed.spaceCode || parsed.spaceNo || heuristic.spaceCode || ''
+    );
 
     let level: number | null = typeof parsed.level === 'number' ? parsed.level : heuristic.level;
     const zone: number | null = typeof parsed.zone === 'number' ? parsed.zone : heuristic.zone;
 
-    // Infer level from schedule code like GF-008 or F4-041 if level is still null
     if (level === null && cleanSpaceCode) {
       if (/^GF-\d+/i.test(cleanSpaceCode)) level = 0;
       else {
@@ -231,11 +236,11 @@ const KNOWN_SPACES = [
 export function fallbackHeuristicParser(text: string): ParsedSiteUpdate {
   const upper = (text || '').toUpperCase();
 
-  // 1. Match explicit Room Code like GF-008, F1-021, F4-041
+  // 1. Match explicit Room Code like GF-008, GF008, F1-021, F1-040C, F4-041
   let spaceCode: string | null = null;
-  const schedCodeMatch = upper.match(/\b(GF-\d{2,4}|F\d-\d{2,4})\b/i);
+  const schedCodeMatch = upper.match(/\b(GF[-\s]?\d{2,4}[A-Z]?|F[1-8][-\s]?\d{2,4}[A-Z]?)\b/i);
   if (schedCodeMatch) {
-    spaceCode = schedCodeMatch[1].toUpperCase();
+    spaceCode = normalizeScheduleCodeInput(schedCodeMatch[1]);
   }
 
   // 2. Match Level (e.g. GF, GROUND FLOOR, L2, LEVEL 2, FLOOR 2)
@@ -281,8 +286,8 @@ export function fallbackHeuristicParser(text: string): ParsedSiteUpdate {
     const textWithoutSpace = space ? upper.replace(space, '') : upper;
     const roomMatch = textWithoutSpace.match(/\b(?:ROOM|RM|R|#)\s*([A-Z0-9-]*\d+[A-Z0-9-]*)\b/i);
     if (roomMatch && /\d/.test(roomMatch[1])) {
-      const cand = roomMatch[1].toUpperCase();
-      if (!/^[ZLF]\d$/i.test(cand)) {
+      const cand = normalizeScheduleCodeInput(roomMatch[1]);
+      if (cand) {
         spaceCode = cand;
       }
     }
@@ -297,6 +302,9 @@ export function fallbackHeuristicParser(text: string): ParsedSiteUpdate {
     finishCode = explicitFinish[1];
     const p = finishCode[0];
     finishKind = p === 'F' ? 'Floor' : p === 'W' ? 'Wall' : p === 'C' ? 'Ceiling' : 'Skirting';
+  } else if (/WATER\s*PROOF/i.test(upper)) {
+    finishCode = 'F03';
+    finishKind = 'Floor';
   } else if (/SCREED/i.test(upper)) {
     finishCode = 'F02';
     finishKind = 'Floor';
@@ -309,10 +317,19 @@ export function fallbackHeuristicParser(text: string): ParsedSiteUpdate {
   } else if (/PLASTER/i.test(upper)) {
     finishCode = 'W02';
     finishKind = 'Wall';
-  } else if (/TILE|TILES|TILING/i.test(upper)) {
+  } else if (/BLOCK\s*WORK|BLOCK/i.test(upper)) {
+    finishCode = 'W01';
+    finishKind = 'Wall';
+  } else if (/WALL\s*TILE/i.test(upper)) {
+    finishCode = 'W08';
+    finishKind = 'Wall';
+  } else if (/TILE|TILES|TILING|PORCELAIN|CERAMIC/i.test(upper)) {
     finishCode = 'F08';
     finishKind = 'Floor';
-  } else if (/CEILING|GYPSUM|GRID/i.test(upper)) {
+  } else if (/T-?GRID|SUSPENSION|600X600/i.test(upper)) {
+    finishCode = 'C07';
+    finishKind = 'Ceiling';
+  } else if (/CEILING|GYPSUM/i.test(upper)) {
     finishCode = 'C03';
     finishKind = 'Ceiling';
   } else if (/SKIRT/i.test(upper)) {
@@ -322,19 +339,19 @@ export function fallbackHeuristicParser(text: string): ParsedSiteUpdate {
 
   // 7. Match status
   let status: 'pending' | 'ongoing' | 'done' | null = null;
-  if (/\b(?:DONE|COMPLETE|COMPLETED|FINISHED|PASSED)\b/i.test(upper)) status = 'done';
-  else if (/\b(?:ONGOING|IN\s*PROGRESS|STARTED|PROGRESS|WORKING)\b/i.test(upper)) status = 'ongoing';
-  else if (/\b(?:PENDING|NOT\s*STARTED|HOLD)\b/i.test(upper)) status = 'pending';
+  if (/\b(?:DONE|COMPLETE|COMPLETED|FINISHED|PASSED|READY)\b/i.test(upper)) status = 'done';
+  else if (/\b(?:ONGOING|IN\s*PROGRESS|STARTED|PROGRESS|WORKING|WIP)\b/i.test(upper)) status = 'ongoing';
+  else if (/\b(?:PENDING|NOT\s*STARTED|HOLD|WAIT)\b/i.test(upper)) status = 'pending';
 
   // 8. Check for snag keyword
   let snag: { text: string; trade: string } | null = null;
-  if (/\b(?:SNAG|DEFECT|ISSUE|CRACK|LEAK|DAMAGE|LIPPAGE|SCRATCH)\b/i.test(upper)) {
+  if (/\b(?:SNAG|DEFECT|ISSUE|CRACK|LEAK|DAMAGE|LIPPAGE|SCRATCH|BROKEN|MISSING|TOUCH\s*UP)\b/i.test(upper)) {
     let trade = 'General';
-    if (/TILE|GROUT|LIPPAGE/i.test(upper)) trade = 'Tile';
-    else if (/PAINT|COAT/i.test(upper)) trade = 'Paint';
-    else if (/PLASTER|CRACK/i.test(upper)) trade = 'Civil';
-    else if (/CEILING|GRID/i.test(upper)) trade = 'Ceiling';
-    else if (/PIPE|LEAK|DUCT|CABLE|MEP/i.test(upper)) trade = 'MEP';
+    if (/TILE|GROUT|LIPPAGE|PORCELAIN|CERAMIC/i.test(upper)) trade = 'Tile';
+    else if (/PAINT|COAT|TOUCH\s*UP/i.test(upper)) trade = 'Paint';
+    else if (/PLASTER|CRACK|BLOCK/i.test(upper)) trade = 'Civil';
+    else if (/CEILING|GRID|GYPSUM/i.test(upper)) trade = 'Ceiling';
+    else if (/PIPE|LEAK|DUCT|CABLE|MEP|DRAIN|SOCKET|LIGHT/i.test(upper)) trade = 'MEP';
     snag = {
       text: text.replace(/^snag\s*[:\-]?\s*/i, '').trim() || text,
       trade

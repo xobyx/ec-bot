@@ -1,5 +1,15 @@
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
-import type { Env, PendingAction, Room, RoomPhoto, RoomSnag, RoomLogEntry, Status } from './types';
+import type {
+  Env,
+  PendingAction,
+  Room,
+  RoomPhoto,
+  RoomSnag,
+  RoomLogEntry,
+  RoomUndoSnapshot,
+  Status
+} from './types';
+import { normalizeScheduleCodeInput } from './ai';
 
 export function getSupabase(env: Env): SupabaseClient {
   return createClient(env.SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY, {
@@ -24,7 +34,7 @@ export function rowToRoom(r: any): Room {
     spaceCode: r.space_code || '',
     notes: r.notes || '',
     checks: r.checks && typeof r.checks === 'object' ? { ...r.checks } : {},
-    steps: r.steps && typeof r.steps === 'object' ? { ...r.steps } : {},
+    steps: r.steps && typeof r.steps === 'object' ? JSON.parse(JSON.stringify(r.steps)) : {},
     log: Array.isArray(r.log) ? [...r.log] : [],
     snags: Array.isArray(r.snags) ? [...r.snags] : [],
     photos: Array.isArray(r.photos) ? [...r.photos] : [],
@@ -33,9 +43,13 @@ export function rowToRoom(r: any): Room {
   };
 }
 
-/**
- * Saves a pending confirmation action into the `kv` table in Supabase.
- */
+export function formatRoomTitle(room: Room): string {
+  const levelDisplay = room.level === 0 ? 'GF' : `L${room.level}`;
+  const zoneDisplay = room.zone ? `Z${room.zone}` : 'All';
+  const codeDisplay = room.spaceCode || room.spaceNo;
+  return `${levelDisplay} ${zoneDisplay} · ${codeDisplay ? codeDisplay + ' — ' : ''}${room.space}`;
+}
+
 export async function savePendingAction(env: Env, action: PendingAction): Promise<void> {
   const sb = getSupabase(env);
   const key = `tg_pending:${action.id}`;
@@ -53,9 +67,6 @@ export async function savePendingAction(env: Env, action: PendingAction): Promis
   }
 }
 
-/**
- * Fetches a pending confirmation action from the `kv` table.
- */
 export async function getPendingAction(env: Env, id: string): Promise<PendingAction | null> {
   const sb = getSupabase(env);
   const key = `tg_pending:${id}`;
@@ -64,19 +75,63 @@ export async function getPendingAction(env: Env, id: string): Promise<PendingAct
   return data.v as PendingAction;
 }
 
-/**
- * Deletes a pending action after confirmation or cancellation.
- */
 export async function deletePendingAction(env: Env, id: string): Promise<void> {
   const sb = getSupabase(env);
   const key = `tg_pending:${id}`;
   await sb.from('kv').delete().eq('k', key);
 }
 
-/**
- * Uploads photo bytes to Supabase Storage bucket (`photos`) at root `${photoId}.jpg`
- * so the ECIT Site Tracker web app can load it directly by `photoId`.
- */
+export async function saveUndoSnapshot(
+  env: Env,
+  undoId: string,
+  snapshot: RoomUndoSnapshot
+): Promise<void> {
+  const sb = getSupabase(env);
+  await sb.from('kv').upsert(
+    {
+      k: `tg_undo:${undoId}`,
+      v: snapshot,
+      updated: new Date().toISOString()
+    },
+    { onConflict: 'k' }
+  );
+}
+
+export async function applyUndoSnapshot(
+  env: Env,
+  undoId: string
+): Promise<{ ok: boolean; roomTitle?: string }> {
+  const sb = getSupabase(env);
+  const key = `tg_undo:${undoId}`;
+  const { data } = await sb.from('kv').select('v').eq('k', key).maybeSingle();
+  if (!data?.v) return { ok: false };
+
+  const snap = data.v as RoomUndoSnapshot;
+  const room = await getRoomByIdOrCode(env, snap.roomId);
+  if (!room) return { ok: false };
+
+  const { error } = await sb
+    .from('rooms')
+    .update({
+      notes: snap.notes || '',
+      checks: snap.checks || {},
+      steps: snap.steps || {},
+      log: snap.log || [],
+      snags: snap.snags || [],
+      photos: snap.photos || []
+    })
+    .eq('id', snap.roomId);
+
+  if (error) throw error;
+
+  if (snap.uploadedPhotoId) {
+    await deleteSitePhoto(env, snap.uploadedPhotoId).catch(() => {});
+  }
+  await sb.from('kv').delete().eq('k', key);
+
+  return { ok: true, roomTitle: formatRoomTitle(room) };
+}
+
 export async function uploadSitePhoto(
   env: Env,
   photoBytes: Uint8Array,
@@ -104,9 +159,6 @@ export async function uploadSitePhoto(
   };
 }
 
-/**
- * Deletes an unconfirmed/cancelled photo from Supabase Storage (`photos`).
- */
 export async function deleteSitePhoto(env: Env, photoId: string): Promise<void> {
   if (!photoId) return;
   const sb = getSupabase(env);
@@ -118,18 +170,12 @@ export async function deleteSitePhoto(env: Env, photoId: string): Promise<void> 
   } catch {}
 }
 
-/**
- * Returns the public URL for a stored photo ID (`${photoId}.jpg`).
- */
 export function getPhotoPublicUrl(env: Env, photoId: string): string {
   const sb = getSupabase(env);
   const bucket = env.SUPABASE_BUCKET || 'photos';
   return sb.storage.from(bucket).getPublicUrl(`${photoId}.jpg`).data.publicUrl;
 }
 
-/**
- * Fetches a room by its primary key `id` or by exact `space_code`.
- */
 export async function getRoomByIdOrCode(env: Env, idOrCode: string): Promise<Room | null> {
   if (!idOrCode) return null;
   const sb = getSupabase(env);
@@ -139,18 +185,24 @@ export async function getRoomByIdOrCode(env: Env, idOrCode: string): Promise<Roo
     return rowToRoom(byIdRes.data);
   }
 
-  const cleanCode = idOrCode.trim().toUpperCase();
-  const byCodeRes = await sb.from('rooms').select('*').ilike('space_code', cleanCode).limit(1);
+  const cleanCode = normalizeScheduleCodeInput(idOrCode) || idOrCode.trim().toUpperCase();
+  const byCodeRes = await sb
+    .from('rooms')
+    .select('*')
+    .or(`space_code.ilike.${cleanCode},space_no.ilike.${cleanCode}`)
+    .limit(1);
   if (!byCodeRes.error && byCodeRes.data && byCodeRes.data.length > 0) {
     return rowToRoom(byCodeRes.data[0]);
+  }
+
+  const byNameRes = await sb.from('rooms').select('*').ilike('space', `%${cleanCode}%`).limit(1);
+  if (!byNameRes.error && byNameRes.data && byNameRes.data.length > 0) {
+    return rowToRoom(byNameRes.data[0]);
   }
 
   return null;
 }
 
-/**
- * Lists rooms for a given level and optional zone.
- */
 export async function getRoomsForLevelZone(
   env: Env,
   level: number,
@@ -177,9 +229,6 @@ export async function getRoomsForLevelZone(
   });
 }
 
-/**
- * Searches Supabase `rooms` to resolve a room or return candidate rooms.
- */
 export async function resolveRoomCandidates(
   env: Env,
   action: PendingAction
@@ -187,7 +236,6 @@ export async function resolveRoomCandidates(
   const sb = getSupabase(env);
   const { parsed, selectedRoomId } = action;
 
-  // 1. If user already picked a specific room ID, load it directly
   if (selectedRoomId) {
     const exact = await getRoomByIdOrCode(env, selectedRoomId);
     if (exact) {
@@ -200,8 +248,7 @@ export async function resolveRoomCandidates(
     }
   }
 
-  // 2. If an explicit room code like GF-008 or F4-041 was provided, try matching globally
-  const targetCode = (parsed.spaceCode || parsed.spaceNo || '').trim().toUpperCase();
+  const targetCode = normalizeScheduleCodeInput(parsed.spaceCode || parsed.spaceNo || '');
   if (targetCode) {
     const { data: codeRows } = await sb
       .from('rooms')
@@ -231,7 +278,6 @@ export async function resolveRoomCandidates(
     }
   }
 
-  // 3. If level is not known yet, check if space name uniquely identifies a room across the project
   const cleanSpace = (parsed.space || '').trim().toUpperCase();
   if (typeof parsed.level !== 'number') {
     if (cleanSpace && cleanSpace !== 'SITE' && cleanSpace !== 'ROOM') {
@@ -251,13 +297,11 @@ export async function resolveRoomCandidates(
     return { exact: null, candidates: [] };
   }
 
-  // 4. Level IS known: fetch rooms on this level
   const levelRooms = await getRoomsForLevelZone(env, parsed.level, parsed.zone);
   if (!levelRooms.length) {
     return { exact: null, candidates: [] };
   }
 
-  // Filter by space name if provided
   if (cleanSpace && cleanSpace !== 'SITE' && cleanSpace !== 'ROOM') {
     const matched = levelRooms.filter(r => {
       const rs = (r.space || '').toUpperCase();
@@ -276,7 +320,6 @@ export async function resolveRoomCandidates(
     }
   }
 
-  // If only 1 room exists in this level + zone, select it
   if (levelRooms.length === 1) {
     return { exact: levelRooms[0], candidates: levelRooms };
   }
@@ -284,10 +327,6 @@ export async function resolveRoomCandidates(
   return { exact: null, candidates: levelRooms };
 }
 
-/**
- * Fetches micro-task templates from `kv` (`k = 'microtasks'`) so marking a finish DONE
- * automatically marks all its micro-tasks as DONE.
- */
 async function getMicroTemplates(env: Env): Promise<Record<string, string[]>> {
   try {
     const sb = getSupabase(env);
@@ -299,9 +338,6 @@ async function getMicroTemplates(env: Env): Promise<Record<string, string[]>> {
   return {};
 }
 
-/**
- * Aligns a parsed finish code with the room's actual finish codes in `room.checks`.
- */
 export function resolveFinishCodeForRoom(
   room: Room,
   finishCode: string | null,
@@ -316,13 +352,11 @@ export function resolveFinishCodeForRoom(
     return finishCode;
   }
 
-  // Smart screed fallback: F02 <-> F03
   if (finishCode === 'F02' || finishCode === 'F03') {
     if (roomCodes.includes('F02')) return 'F02';
     if (roomCodes.includes('F03')) return 'F03';
   }
 
-  // Match by prefix (F, W, C, S) if the room has only 1 code in that category
   const prefix = finishCode
     ? finishCode.charAt(0).toUpperCase()
     : finishKind === 'Floor'
@@ -345,14 +379,11 @@ export function resolveFinishCodeForRoom(
   return finishCode;
 }
 
-/**
- * Applies the confirmed update to the Supabase `rooms` table and `photo_meta` table.
- */
 export async function applyUpdateToRoom(
   env: Env,
   action: PendingAction,
   photoId?: string
-): Promise<{ room: Room; roomTitle: string; appliedFinish?: string }> {
+): Promise<{ room: Room; roomTitle: string; appliedFinish?: string; undoId: string }> {
   const sb = getSupabase(env);
   const { parsed, telegramUsername } = action;
 
@@ -362,12 +393,25 @@ export async function applyUpdateToRoom(
     throw new Error('Please select a valid room before confirming.');
   }
 
+  // Save Undo Snapshot before mutating
+  const undoId = action.id;
+  await saveUndoSnapshot(env, undoId, {
+    roomId: targetRoom.id,
+    notes: targetRoom.notes || '',
+    checks: { ...(targetRoom.checks || {}) },
+    steps: JSON.parse(JSON.stringify(targetRoom.steps || {})),
+    log: Array.isArray(targetRoom.log) ? [...targetRoom.log] : [],
+    snags: Array.isArray(targetRoom.snags) ? [...targetRoom.snags] : [],
+    photos: Array.isArray(targetRoom.photos) ? [...targetRoom.photos] : [],
+    uploadedPhotoId: photoId
+  }).catch(() => {});
+
   const nowIso = new Date().toISOString();
   const author = telegramUsername ? `@${telegramUsername}` : 'Telegram Bot';
   const roomObj: Room = {
     ...targetRoom,
     checks: { ...(targetRoom.checks || {}) },
-    steps: { ...(targetRoom.steps || {}) },
+    steps: JSON.parse(JSON.stringify(targetRoom.steps || {})),
     log: Array.isArray(targetRoom.log) ? [...targetRoom.log] : [],
     snags: Array.isArray(targetRoom.snags) ? [...targetRoom.snags] : [],
     photos: Array.isArray(targetRoom.photos) ? [...targetRoom.photos] : [],
@@ -389,7 +433,6 @@ export async function applyUpdateToRoom(
     }
   };
 
-  // 1. Update finish check(s) if provided
   if (targetFinish && parsed.status) {
     if (targetFinish === 'ALL') {
       Object.keys(roomObj.checks).forEach(c => {
@@ -406,7 +449,6 @@ export async function applyUpdateToRoom(
     }
   }
 
-  // 2. Add snag if detected (newest first, matching ecit-site-tracker)
   const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
   if (parsed.snag) {
     const newSnag: RoomSnag = {
@@ -423,7 +465,6 @@ export async function applyUpdateToRoom(
     roomObj.snags.unshift(newSnag);
   }
 
-  // 3. Add photo if uploaded (using exact photoId so `${photoId}.jpg` loads in web app)
   const photoCaption = parsed.snag
     ? `Snag: ${parsed.snag.text}`
     : parsed.notes || parsed.summary || 'Telegram site update';
@@ -438,7 +479,6 @@ export async function applyUpdateToRoom(
     };
     roomObj.photos.unshift(newPhoto);
 
-    // Sync photo_meta table for ECIT Site Tracker
     try {
       await sb.from('photo_meta').upsert(
         {
@@ -456,7 +496,6 @@ export async function applyUpdateToRoom(
     }
   }
 
-  // 4. Add log entry (newest first)
   const summaryParts: string[] = [];
   if (targetFinish && parsed.status) {
     summaryParts.push(`Finish ${targetFinish} → ${parsed.status.toUpperCase()}`);
@@ -479,15 +518,14 @@ export async function applyUpdateToRoom(
   };
   roomObj.log.unshift(logEntry);
 
-  // 5. Update existing room row in Supabase
+  // Strictly update the 6 editable columns on public.rooms
   const updatePayload = {
     notes: roomObj.notes || '',
     checks: roomObj.checks,
     steps: roomObj.steps,
     log: roomObj.log,
     snags: roomObj.snags,
-    photos: roomObj.photos,
-    updated: nowIso
+    photos: roomObj.photos
   };
 
   const { error: updateError } = await sb
@@ -500,14 +538,219 @@ export async function applyUpdateToRoom(
     throw updateError;
   }
 
-  const levelDisplay = roomObj.level === 0 ? 'GF' : `L${roomObj.level}`;
-  const zoneDisplay = roomObj.zone ? `Z${roomObj.zone}` : 'All';
-  const codeDisplay = roomObj.spaceCode || roomObj.spaceNo;
-  const roomTitle = `${levelDisplay} ${zoneDisplay} · ${codeDisplay ? codeDisplay + ' — ' : ''}${roomObj.space}`;
-
   return {
     room: roomObj,
-    roomTitle,
-    appliedFinish: targetFinish || undefined
+    roomTitle: formatRoomTitle(roomObj),
+    appliedFinish: targetFinish || undefined,
+    undoId
   };
+}
+
+/**
+ * Cycles or updates a single finish check directly on a room from the Interactive Room Browser.
+ */
+export async function quickCycleRoomFinish(
+  env: Env,
+  roomId: string,
+  finishCode: string,
+  authorName?: string
+): Promise<{ room: Room; nextStatus: Status } | null> {
+  const room = await getRoomByIdOrCode(env, roomId);
+  if (!room) return null;
+
+  const sb = getSupabase(env);
+  const current: Status = room.checks?.[finishCode] || 'unknown';
+  const order: Status[] = ['pending', 'ongoing', 'done'];
+  const idx = order.indexOf(current);
+  const nextStatus: Status = order[(idx + 1) % order.length];
+
+  room.checks = { ...(room.checks || {}), [finishCode]: nextStatus };
+  if (nextStatus === 'done') {
+    const codeTemplates = await getMicroTemplates(env);
+    const tmpl = codeTemplates[finishCode] || [];
+    const existing = Object.keys(room.steps?.[finishCode] || {});
+    const allMids = new Set([...existing, ...tmpl]);
+    if (allMids.size > 0) {
+      if (!room.steps) room.steps = {};
+      if (!room.steps[finishCode]) room.steps[finishCode] = {};
+      allMids.forEach(mid => {
+        room.steps[finishCode][mid] = 'done';
+      });
+    }
+  }
+
+  const nowIso = new Date().toISOString();
+  const uid = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+  room.log = [
+    {
+      id: 'l' + uid,
+      ts: nowIso,
+      text: `[Telegram] Finish ${finishCode} → ${nextStatus.toUpperCase()}`,
+      by: authorName ? `@${authorName}` : 'Telegram Bot'
+    },
+    ...(room.log || [])
+  ];
+
+  const { error } = await sb
+    .from('rooms')
+    .update({
+      notes: room.notes || '',
+      checks: room.checks,
+      steps: room.steps || {},
+      log: room.log,
+      snags: room.snags || [],
+      photos: room.photos || []
+    })
+    .eq('id', room.id);
+
+  if (error) throw error;
+  return { room, nextStatus };
+}
+
+/**
+ * Resolves (closes) an open snag in a room directly from Telegram.
+ */
+export async function closeRoomSnag(
+  env: Env,
+  roomId: string,
+  snagId: string,
+  authorName?: string
+): Promise<{ room: Room; closedSnag?: RoomSnag } | null> {
+  const room = await getRoomByIdOrCode(env, roomId);
+  if (!room) return null;
+
+  const sb = getSupabase(env);
+  const nowIso = new Date().toISOString();
+  let closedSnag: RoomSnag | undefined;
+
+  room.snags = (room.snags || []).map(s => {
+    if (s.id === snagId) {
+      closedSnag = { ...s, status: 'closed', closed: nowIso };
+      return closedSnag;
+    }
+    return s;
+  });
+
+  if (!closedSnag) return { room };
+
+  const uid = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+  room.log = [
+    {
+      id: 'l' + uid,
+      ts: nowIso,
+      text: `[Telegram] Snag resolved: "${closedSnag.text}"`,
+      by: authorName ? `@${authorName}` : 'Telegram Bot'
+    },
+    ...(room.log || [])
+  ];
+
+  const { error } = await sb
+    .from('rooms')
+    .update({
+      notes: room.notes || '',
+      checks: room.checks || {},
+      steps: room.steps || {},
+      log: room.log,
+      snags: room.snags,
+      photos: room.photos || []
+    })
+    .eq('id', room.id);
+
+  if (error) throw error;
+  return { room, closedSnag };
+}
+
+/**
+ * Computes live project KPIs and per-level summary from `public.rooms`.
+ */
+export async function getProjectStats(env: Env) {
+  const sb = getSupabase(env);
+  const { data, error } = await sb
+    .from('rooms')
+    .select('id, level, zone, space, space_code, checks, snags, photos');
+  if (error || !data) {
+    throw error || new Error('Failed to load rooms');
+  }
+
+  let totalRooms = data.length;
+  let roomsDone = 0;
+  let checksTotal = 0;
+  let checksDone = 0;
+  let checksOngoing = 0;
+  let checksPending = 0;
+  let openSnags = 0;
+  let totalPhotos = 0;
+
+  const byLevel: Record<number, { total: number; done: number; checksDone: number; checksTotal: number; snags: number }> = {};
+  for (let l = 0; l <= 8; l++) {
+    byLevel[l] = { total: 0, done: 0, checksDone: 0, checksTotal: 0, snags: 0 };
+  }
+
+  for (const r of data) {
+    const lvl = typeof r.level === 'number' ? r.level : 0;
+    if (!byLevel[lvl]) {
+      byLevel[lvl] = { total: 0, done: 0, checksDone: 0, checksTotal: 0, snags: 0 };
+    }
+    byLevel[lvl].total++;
+
+    const checksVals = Object.values((r.checks || {}) as Record<string, Status>);
+    if (checksVals.length > 0 && checksVals.every(st => st === 'done')) {
+      roomsDone++;
+      byLevel[lvl].done++;
+    }
+
+    for (const st of checksVals) {
+      checksTotal++;
+      byLevel[lvl].checksTotal++;
+      if (st === 'done') {
+        checksDone++;
+        byLevel[lvl].checksDone++;
+      } else if (st === 'ongoing') {
+        checksOngoing++;
+      } else if (st === 'pending') {
+        checksPending++;
+      }
+    }
+
+    const rSnags = Array.isArray(r.snags) ? r.snags : [];
+    const rOpen = rSnags.filter((s: any) => s && s.status === 'open').length;
+    openSnags += rOpen;
+    byLevel[lvl].snags += rOpen;
+
+    const rPhotos = Array.isArray(r.photos) ? r.photos : [];
+    totalPhotos += rPhotos.length;
+  }
+
+  return {
+    totalRooms,
+    roomsDone,
+    roomsDonePct: totalRooms ? Math.round((roomsDone / totalRooms) * 100) : 0,
+    checksTotal,
+    checksDone,
+    checksOngoing,
+    checksPending,
+    checksDonePct: checksTotal ? Math.round((checksDone / checksTotal) * 100) : 0,
+    openSnags,
+    totalPhotos,
+    byLevel
+  };
+}
+
+/**
+ * Fetches all rooms that currently have at least one open snag.
+ */
+export async function getRoomsWithOpenSnags(env: Env): Promise<Room[]> {
+  const sb = getSupabase(env);
+  const { data, error } = await sb.from('rooms').select('*');
+  if (error || !data) return [];
+
+  return data
+    .map(rowToRoom)
+    .filter(r => (r.snags || []).some(s => s && s.status === 'open'))
+    .sort((a, b) => {
+      const sa = (a.snags || []).filter(s => s.status === 'open').length;
+      const sbCount = (b.snags || []).filter(s => s.status === 'open').length;
+      if (sbCount !== sa) return sbCount - sa;
+      return a.level - b.level;
+    });
 }

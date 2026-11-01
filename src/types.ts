@@ -43,6 +43,7 @@ export interface TelegramMessage {
   text?: string;
   caption?: string;
   photo?: TelegramPhotoSize[];
+  reply_to_message?: TelegramMessage;
 }
 
 export interface TelegramCallbackQuery {
@@ -93,7 +94,19 @@ export type BotUiMode =
   | 'pick_level'
   | 'pick_zone'
   | 'pick_room'
-  | 'pick_finish';
+  | 'pick_finish'
+  | 'pick_trade';
+
+export interface RoomUndoSnapshot {
+  roomId: string;
+  notes: string;
+  checks: Record<string, Status>;
+  steps: Record<string, Record<string, Status>>;
+  log: RoomLogEntry[];
+  snags: RoomSnag[];
+  photos: RoomPhoto[];
+  uploadedPhotoId?: string;
+}
 
 export interface PendingAction {
   id: string;

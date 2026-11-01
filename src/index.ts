@@ -12,14 +12,16 @@ import {
   editMessageText,
   sendPhoto,
   answerCallbackQuery,
+  setMyCommands,
   getFile,
   downloadTelegramFile
 } from './telegram';
-import { analyzeSiteUpdate } from './ai';
+import { analyzeSiteUpdate, normalizeScheduleCodeInput } from './ai';
 import {
   savePendingAction,
   getPendingAction,
   deletePendingAction,
+  applyUndoSnapshot,
   uploadSitePhoto,
   deleteSitePhoto,
   getPhotoPublicUrl,
@@ -27,8 +29,15 @@ import {
   getRoomsForLevelZone,
   resolveRoomCandidates,
   resolveFinishCodeForRoom,
-  applyUpdateToRoom
+  applyUpdateToRoom,
+  quickCycleRoomFinish,
+  closeRoomSnag,
+  getProjectStats,
+  getRoomsWithOpenSnags,
+  formatRoomTitle
 } from './supabase';
+
+const WEB_APP_BASE = 'https://ecit-tracker.pages.dev';
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -48,7 +57,7 @@ export default {
       );
     }
 
-    // 2. Setup Webhook helper endpoint: visit /setup-webhook to register automatically
+    // 2. Setup Webhook & Commands helper endpoint
     if (request.method === 'GET' && url.pathname === '/setup-webhook') {
       if (!env.TELEGRAM_BOT_TOKEN) {
         return new Response('TELEGRAM_BOT_TOKEN secret is not set', { status: 400 });
@@ -58,7 +67,8 @@ export default {
         `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/setWebhook?url=${encodeURIComponent(webhookUrl)}`
       );
       const tgData: any = await tgRes.json();
-      return new Response(JSON.stringify(tgData, null, 2), {
+      const cmdData = await setMyCommands(env.TELEGRAM_BOT_TOKEN).catch(e => ({ error: String(e) }));
+      return new Response(JSON.stringify({ webhook: tgData, commands: cmdData }, null, 2), {
         headers: { 'Content-Type': 'application/json' }
       });
     }
@@ -86,6 +96,37 @@ export default {
   }
 };
 
+function statusEmoji(st?: Status | string | null): string {
+  if (st === 'done') return '✅';
+  if (st === 'ongoing') return '🔨';
+  if (st === 'pending') return '⏳';
+  return '⚪';
+}
+
+function roomOverallEmoji(room: Room): string {
+  const vals = Object.values(room.checks || {});
+  if (!vals.length) return '⚪';
+  if (vals.every(v => v === 'done')) return '✅';
+  if (vals.some(v => v === 'done' || v === 'ongoing')) return '🔨';
+  if (vals.some(v => v === 'pending')) return '⏳';
+  return '⚪';
+}
+
+function mainMenuKeyboard(): TelegramInlineKeyboardMarkup {
+  return {
+    inline_keyboard: [
+      [
+        { text: '🧭 Browse Rooms', callback_data: 'b_lvl:all' },
+        { text: '📊 Project Status', callback_data: 'b_stats:main' }
+      ],
+      [
+        { text: '⚠️ Open Snags', callback_data: 'b_snags:0' },
+        { text: '🌐 Open Web App', url: WEB_APP_BASE }
+      ]
+    ]
+  };
+}
+
 async function handleTelegramUpdate(update: TelegramUpdate, env: Env): Promise<void> {
   const token = env.TELEGRAM_BOT_TOKEN;
   if (!token) {
@@ -109,19 +150,23 @@ async function handleMessage(message: any, env: Env): Promise<void> {
   const chatId = message.chat.id;
   const text = (message.text || message.caption || '').trim();
 
-  // Command: /start
-  if (text.startsWith('/start')) {
+  // Command: /start or /menu
+  if (text.startsWith('/start') || text.startsWith('/menu')) {
+    await setMyCommands(token).catch(() => {});
     const welcome =
-      `🏗️ *Welcome to ECIT Site Tracker Bot!*\n\n` +
-      `Send site progress updates, photos, or snag reports:\n` +
+      `🏗️ *ECIT Site Tracker Assistant*\n\n` +
+      `Send site progress updates, photos, or snag reports naturally:\n` +
       `• \`F1-021 screed done\`\n` +
-      `• \`Level 1 Zone 2 Garbage Room plaster ongoing\`\n` +
-      `• Or send a *Photo* with a caption (even without level/zone — I will show buttons to pick them!)\n\n` +
-      `*Commands:*\n` +
-      `• \`/room <code or level>\` — Inspect room status & stored photos\n` +
-      `• \`/photos <room code>\` — View saved site photos from storage\n` +
-      `• \`/help\` — Show usage guide`;
-    await sendMessage(token, chatId, welcome);
+      `• \`GF-008 tiles ongoing\`\n` +
+      `• \`Snag: F1-040C wall tile cracked\`\n` +
+      `• Or send a *Photo* (even without room/level — interactive buttons will guide you!)\n\n` +
+      `*Quick Commands:*\n` +
+      `• \`/browse\` — Browse Levels ➔ Zones ➔ Rooms interactively\n` +
+      `• \`/status\` — Live project KPIs & floor progress\n` +
+      `• \`/snags\` — View & resolve open snags across the site\n` +
+      `• \`/room <code>\` — Open interactive room dashboard\n` +
+      `• \`/photos <code>\` — View stored room photos`;
+    await sendMessage(token, chatId, welcome, { reply_markup: mainMenuKeyboard() });
     return;
   }
 
@@ -129,36 +174,76 @@ async function handleMessage(message: any, env: Env): Promise<void> {
   if (text.startsWith('/help')) {
     const help =
       `📖 *ECIT Bot Guide*\n\n` +
-      `1️⃣ *Quick Update:* Send text or photo like \`GF-008 tiles done\` or \`screed done\`. If Level, Zone, or Room is missing, interactive buttons will appear automatically.\n` +
-      `2️⃣ *Interactive Controls:* Tap Finish codes (\`F02\`, \`W04\`, etc.) and Status buttons (\`Pending\`, \`Ongoing\`, \`Done\`) right on the confirmation card.\n` +
-      `3️⃣ *Storage Integration:* Photos are saved directly to Supabase Storage (\`photos\` bucket + \`photo_meta\`) so they open immediately in the ECIT Web App.\n` +
-      `4️⃣ *Inspect Stored Photos:* Use \`/photos F1-021\` or tap *🖼️ Room Photos* on any room card to fetch stored photos back into Telegram.`;
-    await sendMessage(token, chatId, help);
+      `1️⃣ *Smart Updates:* Send text or photo like \`GF-008 tiles done\` or just a photo. If Level, Zone, or Room is missing, tap the buttons to select them.\n` +
+      `2️⃣ *Snag Mode & Trades:* On any confirmation card, tap *⚠️ Log as Snag* to convert a photo/note into a Snag and choose its trade (\`Tile\`, \`Paint\`, \`MEP\`, etc.).\n` +
+      `3️⃣ *Interactive Room Dashboard (\`/browse\` or \`/room\`):* Tap any finish button on a room card to cycle its status (\`Pending ➔ Ongoing ➔ Done\`) or close open snags with 1 tap.\n` +
+      `4️⃣ *Undo Support:* Made a mistake? Tap *↩️ Undo Change* right after saving.\n` +
+      `5️⃣ *Reply Shortcut:* Reply directly to any Room card with a photo or note and the bot will automatically attach it to that room!`;
+    await sendMessage(token, chatId, help, { reply_markup: mainMenuKeyboard() });
+    return;
+  }
+
+  // Command: /status or /stats
+  if (text.startsWith('/status') || text.startsWith('/stats')) {
+    const card = await buildStatsCard(env);
+    await sendMessage(token, chatId, card.text, { reply_markup: card.keyboard });
+    return;
+  }
+
+  // Command: /snags
+  if (text.startsWith('/snags')) {
+    const card = await buildOpenSnagsCard(env, 0);
+    await sendMessage(token, chatId, card.text, { reply_markup: card.keyboard });
+    return;
+  }
+
+  // Command: /browse
+  if (text.startsWith('/browse')) {
+    const card = buildBrowseLevelsCard();
+    await sendMessage(token, chatId, card.text, { reply_markup: card.keyboard });
     return;
   }
 
   // Command: /room or /photos
   if (text.startsWith('/room') || text.startsWith('/photos')) {
-    const arg = text.replace(/^\/(room|photos)\s*/i, '').trim();
+    const isPhotosOnly = text.startsWith('/photos');
+    const arg = text.replace(/^\/(room|photos)(?:@\w+)?\s*/i, '').trim();
     if (!arg) {
-      await sendMessage(
-        token,
-        chatId,
-        `🔎 Usage: \`/room F1-021\` or \`/photos GF-008\` (or send any update to use the interactive level/zone picker).`
-      );
+      const card = buildBrowseLevelsCard();
+      await sendMessage(token, chatId, card.text, { reply_markup: card.keyboard });
       return;
     }
     const room = await getRoomByIdOrCode(env, arg);
     if (!room) {
-      await sendMessage(token, chatId, `⚠️ Room \`${arg}\` not found. Try a schedule code like \`GF-008\` or \`F1-021\`.`);
+      await sendMessage(
+        token,
+        chatId,
+        `⚠️ Room \`${arg}\` not found. Tap below to browse by Level & Zone:`,
+        { reply_markup: buildBrowseLevelsCard().keyboard }
+      );
       return;
     }
-    await sendRoomInspectionAndPhotos(env, chatId, room, text.startsWith('/photos'));
+    if (isPhotosOnly) {
+      await sendRoomInspectionAndPhotos(env, chatId, room, true);
+    } else {
+      const card = buildRoomDashboardCard(room);
+      await sendMessage(token, chatId, card.text, { reply_markup: card.keyboard });
+    }
     return;
   }
 
   if (!text && (!message.photo || message.photo.length === 0)) {
     return;
+  }
+
+  // Check if user replied to a previous bot message mentioning a room code (e.g., GF-008, F1-040C)
+  let replyContextCode: string | null = null;
+  const replyText = message.reply_to_message?.text || message.reply_to_message?.caption || '';
+  if (replyText) {
+    const m = replyText.match(/\b(GF-\d{2,4}[A-Z]?|F[1-8]-\d{2,4}[A-Z]?)\b/i);
+    if (m) {
+      replyContextCode = normalizeScheduleCodeInput(m[1]);
+    }
   }
 
   const statusMsg = await sendMessage(token, chatId, '⏳ *Analyzing site update...*', {
@@ -179,7 +264,6 @@ async function handleMessage(message: any, env: Env): Promise<void> {
         const fileInfo = await getFile(token, photoFileId);
         if (fileInfo.file_path) {
           photoBytes = await downloadTelegramFile(token, fileInfo.file_path);
-          // Upload immediately to Supabase Storage as `${photoId}.jpg` for instant web app compatibility
           try {
             const uploaded = await uploadSitePhoto(env, photoBytes);
             uploadedPhotoId = uploaded.photoId;
@@ -190,7 +274,12 @@ async function handleMessage(message: any, env: Env): Promise<void> {
       }
     }
 
-    const parsed = await analyzeSiteUpdate(env, text, photoBytes);
+    const effectiveText =
+      replyContextCode && !text.toUpperCase().includes(replyContextCode)
+        ? `${replyContextCode} ${text}`.trim()
+        : text;
+
+    const parsed = await analyzeSiteUpdate(env, effectiveText, photoBytes);
 
     const actionId = Math.random().toString(36).substring(2, 10);
     const pendingAction: PendingAction = {
@@ -229,10 +318,326 @@ async function handleMessage(message: any, env: Env): Promise<void> {
   }
 }
 
-/**
- * Builds the interactive message text and inline keyboard depending on what information
- * is already detected vs missing (Level -> Zone -> Room -> Finish/Status -> Confirm).
- */
+// ============================================================================
+// INTERACTIVE BROWSER, STATS & ROOM DASHBOARD BUILDERS
+// ============================================================================
+
+function buildBrowseLevelsCard(): { text: string; keyboard: TelegramInlineKeyboardMarkup } {
+  const text =
+    `🧭 *Interactive Room Browser*\n\n` +
+    `Select a *Floor Level* below to browse zones, inspect rooms, toggle finish statuses, or view photos:`;
+
+  const row1: TelegramInlineKeyboardButton[] = [0, 1, 2, 3, 4].map(lvl => ({
+    text: lvl === 0 ? '🏢 GF' : `🏢 L${lvl}`,
+    callback_data: `b_zn:${lvl}`
+  }));
+  const row2: TelegramInlineKeyboardButton[] = [5, 6, 7, 8].map(lvl => ({
+    text: `🏢 L${lvl}`,
+    callback_data: `b_zn:${lvl}`
+  }));
+
+  return {
+    text,
+    keyboard: {
+      inline_keyboard: [
+        row1,
+        row2,
+        [
+          { text: '📊 Project Status', callback_data: 'b_stats:main' },
+          { text: '⚠️ Open Snags', callback_data: 'b_snags:0' }
+        ]
+      ]
+    }
+  };
+}
+
+function buildBrowseZonesCard(level: number): { text: string; keyboard: TelegramInlineKeyboardMarkup } {
+  const lvlName = level === 0 ? 'Ground Floor (GF)' : `Level ${level}`;
+  const text =
+    `🗺️ *${lvlName} — Select Zone*\n\n` +
+    `Choose a zone on *${lvlName}* to list rooms:`;
+
+  const zRow: TelegramInlineKeyboardButton[] = [1, 2, 3, 4].map(z => ({
+    text: `Zone ${z}`,
+    callback_data: `b_rms:${level}:${z}:0`
+  }));
+
+  return {
+    text,
+    keyboard: {
+      inline_keyboard: [
+        zRow,
+        [
+          { text: '🌐 All Zones on Floor', callback_data: `b_rms:${level}:0:0` },
+          { text: '⬅️ All Levels', callback_data: 'b_lvl:all' }
+        ]
+      ]
+    }
+  };
+}
+
+async function buildBrowseRoomsListCard(
+  env: Env,
+  level: number,
+  zone: number,
+  page: number
+): Promise<{ text: string; keyboard: TelegramInlineKeyboardMarkup }> {
+  const rooms = await getRoomsForLevelZone(env, level, zone);
+  const lvlName = level === 0 ? 'GF' : `L${level}`;
+  const znName = zone === 0 ? 'All Zones' : `Zone ${zone}`;
+
+  const pageSize = 7;
+  const totalPages = Math.max(1, Math.ceil(rooms.length / pageSize));
+  const safePage = Math.min(Math.max(0, page), totalPages - 1);
+  const slice = rooms.slice(safePage * pageSize, (safePage + 1) * pageSize);
+
+  const doneCount = rooms.filter(r => {
+    const vals = Object.values(r.checks || {});
+    return vals.length > 0 && vals.every(v => v === 'done');
+  }).length;
+
+  const text =
+    `🚪 *Rooms in ${lvlName} · ${znName}*\n` +
+    `• *Rooms Complete:* *${doneCount} / ${rooms.length}*\n` +
+    `• *Page:* ${safePage + 1} of ${totalPages}\n\n` +
+    `👇 *Tap any room to open its live inspection dashboard:*`;
+
+  const rows: TelegramInlineKeyboardButton[][] = slice.map(rm => {
+    const emoji = roomOverallEmoji(rm);
+    const code = rm.spaceCode || rm.spaceNo || '';
+    const openSnags = (rm.snags || []).filter(s => s.status === 'open').length;
+    const snagBadge = openSnags > 0 ? ` ⚠️${openSnags}` : '';
+    const photoBadge = (rm.photos || []).length > 0 ? ` 📸${rm.photos.length}` : '';
+    const label = `${emoji} ${code ? code + ' · ' : ''}${rm.space}${snagBadge}${photoBadge}`;
+    return [
+      {
+        text: label.slice(0, 52),
+        callback_data: `b_rm:${rm.id}`
+      }
+    ];
+  });
+
+  if (totalPages > 1) {
+    const nav: TelegramInlineKeyboardButton[] = [];
+    if (safePage > 0) {
+      nav.push({ text: '⬅️ Prev', callback_data: `b_rms:${level}:${zone}:${safePage - 1}` });
+    }
+    if (safePage < totalPages - 1) {
+      nav.push({ text: 'Next ➡️', callback_data: `b_rms:${level}:${zone}:${safePage + 1}` });
+    }
+    if (nav.length) rows.push(nav);
+  }
+
+  rows.push([
+    { text: `🗺️ ${lvlName} Zones`, callback_data: `b_zn:${level}` },
+    { text: '🏢 All Levels', callback_data: 'b_lvl:all' }
+  ]);
+
+  return {
+    text,
+    keyboard: { inline_keyboard: rows }
+  };
+}
+
+function buildRoomDashboardCard(room: Room): { text: string; keyboard: TelegramInlineKeyboardMarkup } {
+  const title = formatRoomTitle(room);
+  const checkEntries = Object.entries(room.checks || {});
+  const checksLines = checkEntries.length
+    ? checkEntries.map(([c, st]) => `  ${statusEmoji(st)} \`${c}\`: *${st.toUpperCase()}*`).join('\n')
+    : '  _No finishes assigned_';
+
+  const openSnags = (room.snags || []).filter(s => s.status === 'open');
+  const snagLines = openSnags.length
+    ? openSnags
+        .slice(0, 5)
+        .map((s, i) => `  ${i + 1}. ⚠️ *[${s.trade || 'General'}]* ${s.text}`)
+        .join('\n')
+    : '  ✅ None';
+
+  const latestLogs = (room.log || []).slice(0, 2);
+  const logLines = latestLogs.length
+    ? latestLogs.map(l => `  • _${l.text}_ (${l.by || 'User'})`).join('\n')
+    : '';
+
+  const text =
+    `🏠 *${title}*\n\n` +
+    `📋 *Finishes (${checkEntries.filter(([, s]) => s === 'done').length}/${checkEntries.length} Done):*\n${checksLines}\n\n` +
+    `⚠️ *Open Snags (${openSnags.length}):*\n${snagLines}\n` +
+    (room.notes ? `\n📝 *Notes:* _${room.notes}_\n` : '') +
+    `📸 *Stored Photos:* ${(room.photos || []).length}` +
+    (logLines ? `\n\n🕒 *Recent Activity:*\n${logLines}` : '') +
+    `\n\n💡 _Tap any finish code below to cycle status (Pending ➔ Ongoing ➔ Done), or reply to this message with a photo/note!_`;
+
+  const rows: TelegramInlineKeyboardButton[][] = [];
+
+  // 1-Tap Finish Toggle buttons
+  if (checkEntries.length > 0) {
+    const btns: TelegramInlineKeyboardButton[] = checkEntries.slice(0, 8).map(([code, st]) => ({
+      text: `${statusEmoji(st)} ${code}`,
+      callback_data: `qfin:${room.id}:${code}`
+    }));
+    for (let i = 0; i < btns.length; i += 4) {
+      rows.push(btns.slice(i, i + 4));
+    }
+  }
+
+  // 1-Tap Close Snag buttons for open snags (up to 3)
+  for (const s of openSnags.slice(0, 3)) {
+    const shortText = s.text.length > 26 ? s.text.slice(0, 26) + '…' : s.text;
+    rows.push([
+      {
+        text: `✅ Resolve Snag: "${shortText}"`,
+        callback_data: `qsnag:${room.id}:${s.id}`
+      }
+    ]);
+  }
+
+  // Photos & Web App link row
+  const actionRow: TelegramInlineKeyboardButton[] = [];
+  if ((room.photos || []).length > 0) {
+    actionRow.push({
+      text: `🖼️ Photos (${room.photos.length})`,
+      callback_data: `vroom:dash:${room.id}`
+    });
+  }
+  actionRow.push({
+    text: '🌐 Open in Web App',
+    url: `${WEB_APP_BASE}/#/room/${encodeURIComponent(room.id)}`
+  });
+  rows.push(actionRow);
+
+  // Back navigation row
+  rows.push([
+    { text: `⬅️ ${room.level === 0 ? 'GF' : 'L' + room.level} Z${room.zone || 'All'} Rooms`, callback_data: `b_rms:${room.level}:${room.zone || 0}:0` },
+    { text: '🧭 All Levels', callback_data: 'b_lvl:all' }
+  ]);
+
+  return {
+    text,
+    keyboard: { inline_keyboard: rows }
+  };
+}
+
+async function buildStatsCard(env: Env): Promise<{ text: string; keyboard: TelegramInlineKeyboardMarkup }> {
+  const stats = await getProjectStats(env);
+
+  const levelLines: string[] = [];
+  for (let l = 0; l <= 8; l++) {
+    const lv = stats.byLevel[l];
+    if (!lv || lv.total === 0) continue;
+    const pct = lv.checksTotal ? Math.round((lv.checksDone / lv.checksTotal) * 100) : 0;
+    const lbl = l === 0 ? 'GF' : `L${l}`;
+    const snagStr = lv.snags > 0 ? ` · ⚠️ ${lv.snags}` : '';
+    levelLines.push(`• *${lbl}:* ${pct}% checks (${lv.done}/${lv.total} rooms done)${snagStr}`);
+  }
+
+  const text =
+    `📊 *ECIT Building — Live Project Status*\n\n` +
+    `🏠 *Rooms Fully Done:* *${stats.roomsDone} / ${stats.totalRooms}* (*${stats.roomsDonePct}%*)\n` +
+    `✅ *Finishes Done:* *${stats.checksDone} / ${stats.checksTotal}* (*${stats.checksDonePct}%*)\n` +
+    `🔨 *Finishes Ongoing:* *${stats.checksOngoing}*\n` +
+    `⏳ *Finishes Pending:* *${stats.checksPending}*\n` +
+    `⚠️ *Open Snags:* *${stats.openSnags}*\n` +
+    `📸 *Stored Photos:* *${stats.totalPhotos}*\n\n` +
+    `*Progress by Floor:*\n${levelLines.join('\n')}\n\n` +
+    `👇 *Tap a floor below to inspect its rooms:*`;
+
+  const row1: TelegramInlineKeyboardButton[] = [0, 1, 2, 3, 4].map(lvl => ({
+    text: lvl === 0 ? 'GF' : `L${lvl}`,
+    callback_data: `b_zn:${lvl}`
+  }));
+  const row2: TelegramInlineKeyboardButton[] = [5, 6, 7, 8].map(lvl => ({
+    text: `L${lvl}`,
+    callback_data: `b_zn:${lvl}`
+  }));
+
+  return {
+    text,
+    keyboard: {
+      inline_keyboard: [
+        row1,
+        row2,
+        [
+          { text: '🔄 Refresh Stats', callback_data: 'b_stats:refresh' },
+          { text: `⚠️ Open Snags (${stats.openSnags})`, callback_data: 'b_snags:0' }
+        ]
+      ]
+    }
+  };
+}
+
+async function buildOpenSnagsCard(
+  env: Env,
+  page: number
+): Promise<{ text: string; keyboard: TelegramInlineKeyboardMarkup }> {
+  const rooms = await getRoomsWithOpenSnags(env);
+  const totalOpenSnags = rooms.reduce(
+    (acc, r) => acc + (r.snags || []).filter(s => s.status === 'open').length,
+    0
+  );
+
+  if (rooms.length === 0) {
+    return {
+      text: `🎉 *Zero Open Snags!*\n\nAll reported snags across the project have been resolved.`,
+      keyboard: mainMenuKeyboard()
+    };
+  }
+
+  const pageSize = 6;
+  const totalPages = Math.max(1, Math.ceil(rooms.length / pageSize));
+  const safePage = Math.min(Math.max(0, page), totalPages - 1);
+  const slice = rooms.slice(safePage * pageSize, (safePage + 1) * pageSize);
+
+  const lines = slice.map(r => {
+    const open = (r.snags || []).filter(s => s.status === 'open');
+    const code = r.spaceCode || r.spaceNo || '';
+    const sample = open[0]?.text || '';
+    return `• *${r.level === 0 ? 'GF' : 'L' + r.level} Z${r.zone || 'All'} ${code}* (${r.space}) — *${open.length} open*\n  _"${sample.slice(0, 60)}"_`;
+  });
+
+  const text =
+    `⚠️ *Open Snags Across Site (${totalOpenSnags} total in ${rooms.length} rooms)*\n` +
+    `Page ${safePage + 1} of ${totalPages}\n\n` +
+    `${lines.join('\n\n')}\n\n` +
+    `👇 *Tap a room below to inspect or resolve its snags:*`;
+
+  const rows: TelegramInlineKeyboardButton[][] = slice.map(r => {
+    const openCount = (r.snags || []).filter(s => s.status === 'open').length;
+    const code = r.spaceCode || r.spaceNo || '';
+    return [
+      {
+        text: `⚠️ (${openCount}) ${r.level === 0 ? 'GF' : 'L' + r.level} ${code} · ${r.space}`.slice(0, 48),
+        callback_data: `b_rm:${r.id}`
+      }
+    ];
+  });
+
+  if (totalPages > 1) {
+    const nav: TelegramInlineKeyboardButton[] = [];
+    if (safePage > 0) {
+      nav.push({ text: '⬅️ Prev', callback_data: `b_snags:${safePage - 1}` });
+    }
+    if (safePage < totalPages - 1) {
+      nav.push({ text: 'Next ➡️', callback_data: `b_snags:${safePage + 1}` });
+    }
+    rows.push(nav);
+  }
+
+  rows.push([
+    { text: '🧭 Browse Rooms', callback_data: 'b_lvl:all' },
+    { text: '📊 Project Status', callback_data: 'b_stats:main' }
+  ]);
+
+  return {
+    text,
+    keyboard: { inline_keyboard: rows }
+  };
+}
+
+// ============================================================================
+// PENDING UPDATE PROMPT BUILDER (LEVEL -> ZONE -> ROOM -> CONFIRM)
+// ============================================================================
+
 async function buildInteractivePrompt(
   env: Env,
   action: PendingAction
@@ -257,15 +662,15 @@ async function buildInteractivePrompt(
         : `Zone ${parsed.zone}`
       : '❓ Not selected';
 
-  const photoLine = action.uploadedPhotoId || action.photoFileId
-    ? `• *Photo:* 📸 Attached ${action.uploadedPhotoId ? `(\`${action.uploadedPhotoId}.jpg\`)` : ''}\n`
-    : '';
+  const photoLine =
+    action.uploadedPhotoId || action.photoFileId
+      ? `• *Photo:* 📸 Attached ${action.uploadedPhotoId ? `(\`${action.uploadedPhotoId}.jpg\`)` : ''}\n`
+      : '';
   const snagLine = parsed.snag
-    ? `• *Snag:* ⚠️ "${parsed.snag.text}" (${parsed.snag.trade})\n`
+    ? `• *Snag:* ⚠️ "${parsed.snag.text}" (Trade: *${parsed.snag.trade}*)\n`
     : '';
   const notesLine = parsed.notes ? `• *Note:* _${parsed.notes}_\n` : '';
 
-  // 1. Determine active step if in 'auto' mode
   let mode = action.uiMode || 'auto';
   if (mode === 'auto') {
     if (typeof parsed.level !== 'number' && !resolved.exact) {
@@ -284,7 +689,9 @@ async function buildInteractivePrompt(
     const text =
       `🏢 *Select Level (Floor)*\n\n` +
       `• *Detected Space:* ${parsed.spaceCode || parsed.space || 'Unspecified'}\n` +
-      (parsed.finishCode ? `• *Finish:* \`${parsed.finishCode}\` ${parsed.status ? `➔ *${parsed.status.toUpperCase()}*` : ''}\n` : '') +
+      (parsed.finishCode
+        ? `• *Finish:* \`${parsed.finishCode}\` ${parsed.status ? `➔ *${parsed.status.toUpperCase()}*` : ''}\n`
+        : '') +
       snagLine +
       photoLine +
       notesLine +
@@ -317,7 +724,9 @@ async function buildInteractivePrompt(
       `🗺️ *Select Zone on ${levelStr}*\n\n` +
       `• *Level:* *${levelStr}*\n` +
       `• *Detected Space:* ${parsed.spaceCode || parsed.space || 'Unspecified'}\n` +
-      (parsed.finishCode ? `• *Finish:* \`${parsed.finishCode}\` ${parsed.status ? `➔ *${parsed.status.toUpperCase()}*` : ''}\n` : '') +
+      (parsed.finishCode
+        ? `• *Finish:* \`${parsed.finishCode}\` ${parsed.status ? `➔ *${parsed.status.toUpperCase()}*` : ''}\n`
+        : '') +
       snagLine +
       photoLine +
       notesLine +
@@ -359,15 +768,17 @@ async function buildInteractivePrompt(
     const text =
       `🚪 *Select Room (${levelStr} · ${zoneStr})*\n\n` +
       (parsed.space ? `• *Searched Space:* \`${parsed.space}\`\n` : '') +
-      (parsed.finishCode ? `• *Finish:* \`${parsed.finishCode}\` ${parsed.status ? `➔ *${parsed.status.toUpperCase()}*` : ''}\n` : '') +
+      (parsed.finishCode
+        ? `• *Finish:* \`${parsed.finishCode}\` ${parsed.status ? `➔ *${parsed.status.toUpperCase()}*` : ''}\n`
+        : '') +
       snagLine +
       photoLine +
-      `\n👇 *Choose the room from Supabase (${candidates.length} found, page ${page + 1}/${totalPages}):*`;
+      `\n👇 *Choose the room (${candidates.length} found, page ${page + 1}/${totalPages}):*`;
 
     const rows: TelegramInlineKeyboardButton[][] = pageItems.map(rm => {
       const code = rm.spaceCode || rm.spaceNo || '';
       const zTag = rm.zone ? `Z${rm.zone}` : 'All';
-      const label = `${code ? code + ' · ' : ''}${rm.space} (${zTag})`;
+      const label = `${roomOverallEmoji(rm)} ${code ? code + ' · ' : ''}${rm.space} (${zTag})`;
       return [
         {
           text: label.slice(0, 48),
@@ -399,19 +810,37 @@ async function buildInteractivePrompt(
     };
   }
 
-  // ================= STEP 4: CONFIRMATION & FINISH/STATUS CONTROLS =================
+  // ================= OPTIONAL: PICK SNAG TRADE =================
+  if (mode === 'pick_trade') {
+    const trades = ['Tile', 'Paint', 'Plaster', 'Ceiling', 'Floor', 'MEP', 'Civil', 'General'];
+    const tradeRows: TelegramInlineKeyboardButton[][] = [];
+    for (let i = 0; i < trades.length; i += 4) {
+      tradeRows.push(
+        trades.slice(i, i + 4).map(t => ({
+          text: parsed.snag?.trade === t ? `🎯 ${t}` : t,
+          callback_data: `strade:${action.id}:${t}`
+        }))
+      );
+    }
+    tradeRows.push([{ text: '⬅️ Back to Confirm', callback_data: `mode:${action.id}:confirm` }]);
+
+    return {
+      text: `🛠️ *Select Snag Trade*\n\n• *Snag:* "${parsed.snag?.text || parsed.notes || 'Site defect'}"\n\n👇 *Tap the responsible trade:*`,
+      keyboard: { inline_keyboard: tradeRows }
+    };
+  }
+
+  // ================= STEP 4: CONFIRMATION & FINISH/STATUS/SNAG CONTROLS =================
   const room = resolved.exact;
   const alignedFinish = resolveFinishCodeForRoom(room, parsed.finishCode, parsed.finishKind);
   if (alignedFinish) {
     parsed.finishCode = alignedFinish;
   }
 
-  const roomCode = room.spaceCode || room.spaceNo || '';
-  const roomLabel = `${room.level === 0 ? 'GF' : 'L' + room.level} ${room.zone ? 'Z' + room.zone : 'All'} · ${roomCode ? roomCode + ' — ' : ''}${room.space}`;
-
+  const roomLabel = formatRoomTitle(room);
   const roomCheckEntries = Object.entries(room.checks || {});
   const checksSummary = roomCheckEntries.length
-    ? roomCheckEntries.map(([c, st]) => `${c}:${st}`).join(', ')
+    ? roomCheckEntries.map(([c, st]) => `${statusEmoji(st)}${c}`).join(' ')
     : 'No finishes linked';
 
   const finishDisplay = parsed.finishCode
@@ -421,7 +850,7 @@ async function buildInteractivePrompt(
   const text =
     `📋 *Confirm Room Update*\n\n` +
     `• *Room:* *${roomLabel}*\n` +
-    `• *Room Finishes:* \`${checksSummary}\`\n` +
+    `• *Current Finishes:* ${checksSummary}\n` +
     `• *Finish Update:* ${finishDisplay}\n` +
     snagLine +
     photoLine +
@@ -459,6 +888,21 @@ async function buildInteractivePrompt(
     }))
   );
 
+  // Snag toggle & Trade picker row
+  const snagRow: TelegramInlineKeyboardButton[] = [
+    {
+      text: parsed.snag ? '⚠️ Snag: ON (Tap to turn OFF)' : '➕ Log as Snag',
+      callback_data: `tsnag:${action.id}:toggle`
+    }
+  ];
+  if (parsed.snag) {
+    snagRow.push({
+      text: `🛠️ Trade: ${parsed.snag.trade}`,
+      callback_data: `mode:${action.id}:pick_trade`
+    });
+  }
+  keyboardRows.push(snagRow);
+
   // Location & Stored Photos row
   const storedPhotosCount = (room.photos || []).length;
   const metaRow: TelegramInlineKeyboardButton[] = [
@@ -486,12 +930,17 @@ async function buildInteractivePrompt(
   };
 }
 
+// ============================================================================
+// CALLBACK QUERY HANDLER
+// ============================================================================
+
 async function handleCallbackQuery(query: any, env: Env): Promise<void> {
   const token = env.TELEGRAM_BOT_TOKEN;
   const data = query.data || '';
   const message = query.message;
   const chatId = message?.chat?.id;
   const messageId = message?.message_id;
+  const authorName = query.from?.username || query.from?.first_name;
 
   if (!data.includes(':')) {
     await answerCallbackQuery(token, query.id);
@@ -502,6 +951,119 @@ async function handleCallbackQuery(query: any, env: Env): Promise<void> {
   const actionType = parts[0];
   const actionId = parts[1];
   const value = parts.slice(2).join(':');
+
+  // --- Interactive Browser & Stats Callbacks ---
+  if (actionType === 'b_lvl') {
+    await answerCallbackQuery(token, query.id);
+    const card = buildBrowseLevelsCard();
+    if (chatId && messageId) {
+      await editMessageText(token, chatId, messageId, card.text, { reply_markup: card.keyboard });
+    }
+    return;
+  }
+
+  if (actionType === 'b_zn') {
+    const lvl = parseInt(actionId, 10) || 0;
+    await answerCallbackQuery(token, query.id, lvl === 0 ? 'Ground Floor' : `Level ${lvl}`);
+    const card = buildBrowseZonesCard(lvl);
+    if (chatId && messageId) {
+      await editMessageText(token, chatId, messageId, card.text, { reply_markup: card.keyboard });
+    }
+    return;
+  }
+
+  if (actionType === 'b_rms') {
+    const lvl = parseInt(actionId, 10) || 0;
+    const [zStr, pStr] = value.split(':');
+    const zone = parseInt(zStr, 10) || 0;
+    const page = parseInt(pStr, 10) || 0;
+    await answerCallbackQuery(token, query.id);
+    const card = await buildBrowseRoomsListCard(env, lvl, zone, page);
+    if (chatId && messageId) {
+      await editMessageText(token, chatId, messageId, card.text, { reply_markup: card.keyboard });
+    }
+    return;
+  }
+
+  if (actionType === 'b_rm') {
+    const roomId = parts.slice(1).join(':');
+    await answerCallbackQuery(token, query.id);
+    const room = await getRoomByIdOrCode(env, roomId);
+    if (room && chatId && messageId) {
+      const card = buildRoomDashboardCard(room);
+      await editMessageText(token, chatId, messageId, card.text, { reply_markup: card.keyboard });
+    }
+    return;
+  }
+
+  if (actionType === 'qfin') {
+    const roomId = actionId;
+    const finishCode = value;
+    const updated = await quickCycleRoomFinish(env, roomId, finishCode, authorName);
+    if (updated && chatId && messageId) {
+      await answerCallbackQuery(token, query.id, `${finishCode} → ${updated.nextStatus.toUpperCase()}`);
+      const card = buildRoomDashboardCard(updated.room);
+      await editMessageText(token, chatId, messageId, card.text, { reply_markup: card.keyboard });
+    } else {
+      await answerCallbackQuery(token, query.id, 'Could not update finish', true);
+    }
+    return;
+  }
+
+  if (actionType === 'qsnag') {
+    const roomId = actionId;
+    const snagId = value;
+    const res = await closeRoomSnag(env, roomId, snagId, authorName);
+    if (res && chatId && messageId) {
+      await answerCallbackQuery(token, query.id, 'Snag marked as Resolved ✅');
+      const card = buildRoomDashboardCard(res.room);
+      await editMessageText(token, chatId, messageId, card.text, { reply_markup: card.keyboard });
+    } else {
+      await answerCallbackQuery(token, query.id, 'Could not resolve snag', true);
+    }
+    return;
+  }
+
+  if (actionType === 'b_stats') {
+    await answerCallbackQuery(token, query.id, 'Refreshing project stats...');
+    const card = await buildStatsCard(env);
+    if (chatId && messageId) {
+      await editMessageText(token, chatId, messageId, card.text, { reply_markup: card.keyboard });
+    }
+    return;
+  }
+
+  if (actionType === 'b_snags') {
+    const page = parseInt(actionId, 10) || 0;
+    await answerCallbackQuery(token, query.id);
+    const card = await buildOpenSnagsCard(env, page);
+    if (chatId && messageId) {
+      await editMessageText(token, chatId, messageId, card.text, { reply_markup: card.keyboard });
+    }
+    return;
+  }
+
+  // Undo last confirmed update
+  if (actionType === 'undo') {
+    await answerCallbackQuery(token, query.id, 'Reverting update...');
+    try {
+      const res = await applyUndoSnapshot(env, actionId);
+      if (res.ok && chatId && messageId) {
+        await editMessageText(
+          token,
+          chatId,
+          messageId,
+          `↩️ *Update Reverted*\n\nRoom *${res.roomTitle}* was restored to its previous state.`,
+          { reply_markup: mainMenuKeyboard() }
+        );
+      } else {
+        await answerCallbackQuery(token, query.id, 'Undo snapshot expired or already used', true);
+      }
+    } catch (e: any) {
+      await answerCallbackQuery(token, query.id, 'Undo failed: ' + (e?.message || 'Error'), true);
+    }
+    return;
+  }
 
   // View stored photos for a room directly from a completed card
   if (actionType === 'vroom') {
@@ -606,6 +1168,37 @@ async function handleCallbackQuery(query: any, env: Env): Promise<void> {
     return;
   }
 
+  if (actionType === 'tsnag') {
+    if (pending.parsed.snag) {
+      pending.parsed.snag = null;
+      await answerCallbackQuery(token, query.id, 'Snag mode OFF');
+    } else {
+      pending.parsed.snag = {
+        text: pending.parsed.notes || pending.parsed.summary || 'Site defect reported via Telegram',
+        trade: pending.parsed.finishKind === 'Ceiling' ? 'Ceiling' : pending.parsed.finishKind === 'Floor' ? 'Tile' : 'General'
+      };
+      await answerCallbackQuery(token, query.id, 'Snag mode ON ⚠️');
+    }
+    pending.uiMode = 'confirm';
+    await updateCardMessage(env, chatId, messageId, pending);
+    return;
+  }
+
+  if (actionType === 'strade') {
+    if (!pending.parsed.snag) {
+      pending.parsed.snag = {
+        text: pending.parsed.notes || 'Site defect',
+        trade: value
+      };
+    } else {
+      pending.parsed.snag.trade = value;
+    }
+    pending.uiMode = 'confirm';
+    await answerCallbackQuery(token, query.id, `Trade: ${value}`);
+    await updateCardMessage(env, chatId, messageId, pending);
+    return;
+  }
+
   if (actionType === 'rphotos') {
     await answerCallbackQuery(token, query.id, 'Loading photos from Supabase Storage...');
     const room = await getRoomByIdOrCode(env, value);
@@ -621,7 +1214,6 @@ async function handleCallbackQuery(query: any, env: Env): Promise<void> {
     try {
       let photoId = pending.uploadedPhotoId;
 
-      // Fallback upload if photoFileId exists but wasn't uploaded yet
       if (!photoId && pending.photoFileId) {
         try {
           const fileInfo = await getFile(token, pending.photoFileId);
@@ -655,23 +1247,28 @@ async function handleCallbackQuery(query: any, env: Env): Promise<void> {
         photoLine +
         `\n_Live synced with Supabase & ECIT Web App._`;
 
-      const postConfirmKeyboard: TelegramInlineKeyboardMarkup | undefined =
-        (result.room.photos || []).length > 0
-          ? {
-              inline_keyboard: [
-                [
-                  {
-                    text: `🖼️ View Room Photos (${result.room.photos.length})`,
-                    callback_data: `vroom:${actionId}:${result.room.id}`
-                  }
-                ]
-              ]
-            }
-          : undefined;
+      const postButtons: TelegramInlineKeyboardButton[][] = [
+        [
+          { text: '🏠 Open Room Card', callback_data: `b_rm:${result.room.id}` },
+          { text: '↩️ Undo Change', callback_data: `undo:${result.undoId}` }
+        ]
+      ];
+      if ((result.room.photos || []).length > 0) {
+        postButtons.push([
+          {
+            text: `🖼️ View Room Photos (${result.room.photos.length})`,
+            callback_data: `vroom:${actionId}:${result.room.id}`
+          },
+          {
+            text: '🌐 Open in Web App',
+            url: `${WEB_APP_BASE}/#/room/${encodeURIComponent(result.room.id)}`
+          }
+        ]);
+      }
 
       if (chatId && messageId) {
         await editMessageText(token, chatId, messageId, successText, {
-          reply_markup: postConfirmKeyboard
+          reply_markup: { inline_keyboard: postButtons }
         });
       }
     } catch (err: any) {
@@ -703,9 +1300,6 @@ async function updateCardMessage(
   }
 }
 
-/**
- * Sends room status summary and up to 5 latest stored photos from Supabase Storage (`photos` bucket).
- */
 async function sendRoomInspectionAndPhotos(
   env: Env,
   chatId: number | string,
@@ -713,24 +1307,11 @@ async function sendRoomInspectionAndPhotos(
   photosOnly = false
 ) {
   const token = env.TELEGRAM_BOT_TOKEN;
-  const code = room.spaceCode || room.spaceNo || '';
-  const title = `${room.level === 0 ? 'GF' : 'L' + room.level} Z${room.zone || 'All'} · ${code ? code + ' — ' : ''}${room.space}`;
+  const title = formatRoomTitle(room);
 
   if (!photosOnly) {
-    const checks = Object.entries(room.checks || {})
-      .map(([c, st]) => `\`${c}\`: *${st.toUpperCase()}*`)
-      .join(' · ');
-    const openSnags = (room.snags || []).filter(s => s.status === 'open');
-    const snagsText = openSnags.length
-      ? openSnags.map(s => `  - [${s.trade || 'General'}] ${s.text}`).join('\n')
-      : 'None';
-
-    const summary =
-      `🏠 *${title}*\n\n` +
-      `• *Finishes:* ${checks || 'None'}\n` +
-      `• *Open Snags (${openSnags.length}):*\n${snagsText}\n` +
-      `• *Stored Photos:* ${(room.photos || []).length}`;
-    await sendMessage(token, chatId, summary);
+    const card = buildRoomDashboardCard(room);
+    await sendMessage(token, chatId, card.text, { reply_markup: card.keyboard });
   }
 
   const photos = (room.photos || []).slice(0, 5);
