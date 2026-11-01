@@ -5,13 +5,15 @@ import type {
   TelegramInlineKeyboardButton,
   TelegramInlineKeyboardMarkup,
   Room,
-  Status
+  Status,
+  TelegramAuthorizedUser
 } from './types';
 import {
   sendMessage,
   editMessageText,
   sendPhoto,
   answerCallbackQuery,
+  deleteMessage,
   setMyCommands,
   getFile,
   downloadTelegramFile
@@ -38,27 +40,55 @@ import {
   finishCompactName,
   finishShortDesc,
   formatFinishButton,
-  formatFinishLine
+  formatFinishLine,
+  getTelegramAuthRegistry,
+  getAuthorizedTelegramUser,
+  formatTelegramAuthorLabel,
+  generateTelegramLinkCode,
+  consumeTelegramLinkCode,
+  authenticateWithInviteCode,
+  authenticateWithSupabaseLogin,
+  verifySupabaseUserFromToken,
+  requestTelegramAccess,
+  setTelegramUserStatus,
+  unlinkTelegramUser
 } from './supabase';
 
 const WEB_APP_BASE = 'https://ecit-tracker.pages.dev';
+const BOT_USERNAME = 'ec20026bot';
+
+const CORS_HEADERS: Record<string, string> = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type, Authorization'
+};
+
+function jsonResponse(body: any, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: {
+      'Content-Type': 'application/json',
+      ...CORS_HEADERS
+    }
+  });
+}
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
 
+    if (request.method === 'OPTIONS') {
+      return new Response(null, { status: 204, headers: CORS_HEADERS });
+    }
+
     // 1. Health check endpoint
     if (request.method === 'GET' && url.pathname === '/') {
-      return new Response(
-        JSON.stringify({
-          status: 'online',
-          service: 'ECIT Site Tracker Telegram Bot Worker',
-          time: new Date().toISOString()
-        }),
-        {
-          headers: { 'Content-Type': 'application/json' }
-        }
-      );
+      return jsonResponse({
+        status: 'online',
+        service: 'ECIT Site Tracker Telegram Bot Worker',
+        botUsername: BOT_USERNAME,
+        time: new Date().toISOString()
+      });
     }
 
     // 2. Setup Webhook & Commands helper endpoint
@@ -72,12 +102,15 @@ export default {
       );
       const tgData: any = await tgRes.json();
       const cmdData = await setMyCommands(env.TELEGRAM_BOT_TOKEN).catch(e => ({ error: String(e) }));
-      return new Response(JSON.stringify({ webhook: tgData, commands: cmdData }, null, 2), {
-        headers: { 'Content-Type': 'application/json' }
-      });
+      return jsonResponse({ webhook: tgData, commands: cmdData });
     }
 
-    // 3. Webhook handler: POST / or POST /webhook
+    // 3. Web App <-> Telegram Auth API (/api/tg-auth)
+    if (url.pathname === '/api/tg-auth') {
+      return handleWebTelegramAuthApi(request, env);
+    }
+
+    // 4. Webhook handler: POST / or POST /webhook
     if (request.method === 'POST') {
       if (env.WEBHOOK_SECRET) {
         const headerSecret = request.headers.get('X-Telegram-Bot-Api-Secret-Token');
@@ -96,9 +129,135 @@ export default {
       }
     }
 
-    return new Response('Not Found', { status: 404 });
+    return new Response('Not Found', { status: 404, headers: CORS_HEADERS });
   }
 };
+
+async function handleWebTelegramAuthApi(request: Request, env: Env): Promise<Response> {
+  const authHeader = request.headers.get('Authorization') || '';
+  const token = authHeader.replace(/^Bearer\s+/i, '').trim();
+  const webUser = await verifySupabaseUserFromToken(env, token);
+  if (!webUser) {
+    return jsonResponse({ ok: false, error: 'Unauthorized: valid Supabase session required' }, 401);
+  }
+
+  try {
+    const body: any = request.method === 'POST' ? await request.json().catch(() => ({})) : {};
+    const action = body.action || 'status';
+
+    if (action === 'status') {
+      const reg = await getTelegramAuthRegistry(env);
+      const allList = Object.values(reg.users).sort((a, b) =>
+        (b.linkedAt || '').localeCompare(a.linkedAt || '')
+      );
+      const linkedUsers = allList.filter(
+        u =>
+          u.supabaseUserId === webUser.id ||
+          (webUser.email && u.email && u.email.toLowerCase() === webUser.email.toLowerCase())
+      );
+      const activeCode = Object.values(reg.linkCodes).find(c => c.supabaseUserId === webUser.id) || null;
+      return jsonResponse({
+        ok: true,
+        botUsername: BOT_USERNAME,
+        linkedUsers,
+        activeCode,
+        allUsers: webUser.isAdmin ? allList : undefined
+      });
+    }
+
+    if (action === 'generate_code') {
+      const codeObj = await generateTelegramLinkCode(env, {
+        supabaseUserId: webUser.id,
+        email: webUser.email,
+        displayName: webUser.displayName,
+        isAdmin: webUser.isAdmin
+      });
+      return jsonResponse({
+        ok: true,
+        botUsername: BOT_USERNAME,
+        code: codeObj.code,
+        expiresAt: codeObj.expiresAt,
+        deepLink: `https://t.me/${BOT_USERNAME}?start=link_${codeObj.code}`
+      });
+    }
+
+    if (action === 'unlink') {
+      const targetTgId = body.telegramUserId ? Number(body.telegramUserId) : undefined;
+      const reg = await getTelegramAuthRegistry(env);
+      if (targetTgId) {
+        const target = reg.users[String(targetTgId)];
+        if (!target) {
+          return jsonResponse({ ok: false, error: 'Telegram user not found' }, 404);
+        }
+        if (!webUser.isAdmin && target.supabaseUserId !== webUser.id) {
+          return jsonResponse({ ok: false, error: 'Forbidden' }, 403);
+        }
+        await unlinkTelegramUser(env, { telegramUserId: targetTgId });
+      } else {
+        await unlinkTelegramUser(env, { supabaseUserId: webUser.id });
+      }
+      return jsonResponse({ ok: true });
+    }
+
+    if (action === 'admin_set_status') {
+      if (!webUser.isAdmin) {
+        return jsonResponse({ ok: false, error: 'Admin privileges required' }, 403);
+      }
+      const targetTgId = Number(body.telegramUserId);
+      if (!targetTgId) {
+        return jsonResponse({ ok: false, error: 'Invalid telegramUserId' }, 400);
+      }
+      const status: 'approved' | 'revoked' | 'pending' =
+        body.status === 'revoked' ? 'revoked' : body.status === 'pending' ? 'pending' : 'approved';
+      const role: 'admin' | 'inspector' = body.role === 'admin' ? 'admin' : 'inspector';
+      const updated = await setTelegramUserStatus(
+        env,
+        targetTgId,
+        status,
+        role,
+        webUser.displayName,
+        {
+          displayName: body.displayName,
+          telegramUsername: body.telegramUsername
+        }
+      );
+
+      if (env.TELEGRAM_BOT_TOKEN && updated.chatId) {
+        if (status === 'approved') {
+          await sendMessage(
+            env.TELEGRAM_BOT_TOKEN,
+            updated.chatId,
+            `🎉 *Access Approved!*\n\n` +
+              `Your Telegram account has been authorized for *ECIT Site Tracker* by *${webUser.displayName}*.\n` +
+              `• *Role:* ${role === 'admin' ? '🛡️ Project Admin' : '👷 Site Inspector'}\n` +
+              `• *Attribution Name:* ${updated.displayName}\n\n` +
+              `Tap below to start browsing rooms or send a site update!`,
+            { reply_markup: mainMenuKeyboard() }
+          ).catch(() => {});
+        } else if (status === 'revoked') {
+          await sendMessage(
+            env.TELEGRAM_BOT_TOKEN,
+            updated.chatId,
+            `🚫 Your Telegram access to *ECIT Site Tracker* has been revoked by an administrator.`
+          ).catch(() => {});
+        }
+      }
+
+      const reg = await getTelegramAuthRegistry(env);
+      return jsonResponse({
+        ok: true,
+        user: updated,
+        allUsers: Object.values(reg.users).sort((a, b) =>
+          (b.linkedAt || '').localeCompare(a.linkedAt || '')
+        )
+      });
+    }
+
+    return jsonResponse({ ok: false, error: `Unknown action: ${action}` }, 400);
+  } catch (e: any) {
+    return jsonResponse({ ok: false, error: e?.message || 'Server error' }, 500);
+  }
+}
 
 function statusEmoji(st?: Status | string | null): string {
   if (st === 'done') return '✅';
@@ -116,19 +275,161 @@ function roomOverallEmoji(room: Room): string {
   return '⚪';
 }
 
-function mainMenuKeyboard(): TelegramInlineKeyboardMarkup {
-  return {
-    inline_keyboard: [
-      [
-        { text: '🧭 Browse Rooms', callback_data: 'b_lvl:all' },
-        { text: '📊 Project Status', callback_data: 'b_stats:main' }
-      ],
-      [
-        { text: '⚠️ Open Snags', callback_data: 'b_snags:0' },
-        { text: '🌐 Open Web App', url: WEB_APP_BASE }
-      ]
+function mainMenuKeyboard(isAdmin = false): TelegramInlineKeyboardMarkup {
+  const rows: TelegramInlineKeyboardButton[][] = [
+    [
+      { text: '🧭 Browse Rooms', callback_data: 'b_lvl:all' },
+      { text: '📊 Project Status', callback_data: 'b_stats:main' }
+    ],
+    [
+      { text: '⚠️ Open Snags', callback_data: 'b_snags:0' },
+      { text: '👤 My Account', callback_data: 'tg_acc:me' }
+    ],
+    [
+      { text: '🌐 Open Web App', url: WEB_APP_BASE }
     ]
+  ];
+  if (isAdmin) {
+    rows[2].unshift({ text: '🛡️ Telegram Users', callback_data: 'tg_adm:list:0' });
+  }
+  return { inline_keyboard: rows };
+}
+
+function buildAuthRequiredCard(
+  tgUser?: { id?: number; username?: string; first_name?: string },
+  existingUser?: TelegramAuthorizedUser | null
+): { text: string; keyboard: TelegramInlineKeyboardMarkup } {
+  const isPending = existingUser?.status === 'pending';
+  const isRevoked = existingUser?.status === 'revoked';
+
+  const statusBanner = isPending
+    ? `⏳ *Status:* Your access request is *pending Admin approval*.\n\n`
+    : isRevoked
+    ? `🚫 *Status:* Your Telegram access was revoked by an administrator.\n\n`
+    : '';
+
+  const text =
+    `🔒 *ECIT Site Tracker — Authentication Required*\n\n` +
+    statusBanner +
+    `To view or update site records via Telegram, authenticate using any of these methods:\n\n` +
+    `1️⃣ *Link via Web App (Recommended):*\n` +
+    `Open the [ECIT Web App](${WEB_APP_BASE}) ➔ *Account* ➔ *Link Telegram Bot*, then tap *Open in Telegram* or send:\n` +
+    `\`/auth <6-digit-code>\`\n\n` +
+    `2️⃣ *Sign In with Web App Account:*\n` +
+    `\`/login your@email.com yourpassword\`\n` +
+    `_(Your password message is automatically deleted immediately)_\n\n` +
+    `3️⃣ *Project Invitation Code:*\n` +
+    `\`/auth <INVITE_CODE>\`\n\n` +
+    `4️⃣ *Or Request Admin Approval:*\n` +
+    `Tap *🙋 Request Access* below (Telegram ID: \`${tgUser?.id || 'unknown'}\`).`;
+
+  const buttons: TelegramInlineKeyboardButton[][] = [];
+  if (!isPending) {
+    buttons.push([{ text: '🙋 Request Access from Admin', callback_data: 'tg_req:ask' }]);
+  } else {
+    buttons.push([{ text: '🔄 Check Approval Status', callback_data: 'tg_req:check' }]);
+  }
+  buttons.push([{ text: '🌐 Open Web App Account', url: WEB_APP_BASE }]);
+
+  return {
+    text,
+    keyboard: { inline_keyboard: buttons }
   };
+}
+
+function buildAccountCard(authUser: TelegramAuthorizedUser): {
+  text: string;
+  keyboard: TelegramInlineKeyboardMarkup;
+} {
+  const roleBadge = authUser.role === 'admin' ? '🛡️ Project Admin' : '👷 Site Inspector';
+  const methodLabel =
+    authUser.authMethod === 'web_link'
+      ? 'Web App Account Link'
+      : authUser.authMethod === 'supabase_login'
+      ? 'Web App Email & Password'
+      : authUser.authMethod === 'invite_code'
+      ? 'Project Invitation Code'
+      : 'Admin Approval';
+
+  const text =
+    `👤 *Authenticated Telegram Account*\n\n` +
+    `• *Name:* *${authUser.displayName || 'Inspector'}*\n` +
+    (authUser.email ? `• *Web Account:* \`${authUser.email}\`\n` : '') +
+    `• *Telegram:* ${authUser.telegramUsername ? `@${authUser.telegramUsername}` : '—'} (\`${authUser.telegramUserId}\`)\n` +
+    `• *Role:* ${roleBadge}\n` +
+    `• *Auth Method:* ${methodLabel}\n` +
+    `• *Linked:* ${authUser.linkedAt ? authUser.linkedAt.slice(0, 10) : 'Active'}\n\n` +
+    `_All room finish updates, photos, and snags you send are logged under your name._`;
+
+  const rows: TelegramInlineKeyboardButton[][] = [
+    [
+      { text: '🧭 Browse Rooms', callback_data: 'b_lvl:all' },
+      { text: '📊 Project Status', callback_data: 'b_stats:main' }
+    ]
+  ];
+  if (authUser.role === 'admin') {
+    rows.push([{ text: '🛡️ Manage Telegram Users', callback_data: 'tg_adm:list:0' }]);
+  }
+  rows.push([{ text: '🔓 Unlink / Sign Out', callback_data: 'tg_unlk:me' }]);
+
+  return { text, keyboard: { inline_keyboard: rows } };
+}
+
+async function buildAdminUsersCard(env: Env): Promise<{
+  text: string;
+  keyboard: TelegramInlineKeyboardMarkup;
+}> {
+  const reg = await getTelegramAuthRegistry(env);
+  const all = Object.values(reg.users).sort((a, b) => {
+    const order: Record<string, number> = { pending: 0, approved: 1, revoked: 2 };
+    return (order[a.status] ?? 9) - (order[b.status] ?? 9) || (b.linkedAt || '').localeCompare(a.linkedAt || '');
+  });
+
+  const pendingCount = all.filter(u => u.status === 'pending').length;
+  const approvedCount = all.filter(u => u.status === 'approved').length;
+
+  let lines =
+    `🛡️ *Telegram User Access Manager*\n` +
+    `Approved: *${approvedCount}* · Pending: *${pendingCount}* · Total: *${all.length}*\n\n`;
+
+  const rows: TelegramInlineKeyboardButton[][] = [];
+
+  if (!all.length) {
+    lines += `_No Telegram users registered yet._`;
+  } else {
+    for (const u of all.slice(0, 10)) {
+      const icon = u.status === 'approved' ? (u.role === 'admin' ? '🛡️' : '✅') : u.status === 'pending' ? '⏳' : '🚫';
+      const handle = u.telegramUsername ? `@${u.telegramUsername}` : `#${u.telegramUserId}`;
+      const roleTag = u.role === 'admin' ? 'ADMIN' : 'INSPECTOR';
+      lines += `${icon} *${u.displayName || handle}* (${handle}) — \`${u.status.toUpperCase()}\` · ${roleTag}\n`;
+
+      if (u.status === 'pending') {
+        rows.push([
+          { text: `✅ Approve ${handle}`, callback_data: `tg_adm:app:${u.telegramUserId}` },
+          { text: `🛡️ Admin ${handle}`, callback_data: `tg_adm:adm:${u.telegramUserId}` },
+          { text: `🚫 Reject`, callback_data: `tg_adm:rev:${u.telegramUserId}` }
+        ]);
+      } else if (u.status === 'approved') {
+        const toggleRole = u.role === 'admin' ? 'app' : 'adm';
+        const toggleLabel = u.role === 'admin' ? `👷 Make Inspector (${handle})` : `🛡️ Make Admin (${handle})`;
+        rows.push([
+          { text: toggleLabel, callback_data: `tg_adm:${toggleRole}:${u.telegramUserId}` },
+          { text: `🚫 Revoke ${handle}`, callback_data: `tg_adm:rev:${u.telegramUserId}` }
+        ]);
+      } else {
+        rows.push([
+          { text: `✅ Re-Approve ${handle}`, callback_data: `tg_adm:app:${u.telegramUserId}` }
+        ]);
+      }
+    }
+  }
+
+  rows.push([
+    { text: '🔄 Refresh List', callback_data: 'tg_adm:list:0' },
+    { text: '🏠 Main Menu', callback_data: 'b_stats:main' }
+  ]);
+
+  return { text: lines, keyboard: { inline_keyboard: rows } };
 }
 
 async function handleTelegramUpdate(update: TelegramUpdate, env: Env): Promise<void> {
@@ -153,12 +454,230 @@ async function handleMessage(message: any, env: Env): Promise<void> {
   const token = env.TELEGRAM_BOT_TOKEN;
   const chatId = message.chat.id;
   const text = (message.text || message.caption || '').trim();
+  const tgFrom = message.from || { id: chatId, first_name: 'User' };
+  const tgUserId = Number(tgFrom.id || chatId);
+
+  // 1. Check /start deep-link pairing code: `/start link_123456` or `/start 123456`
+  if (text.startsWith('/start')) {
+    await setMyCommands(token).catch(() => {});
+    const startArg = text.replace(/^\/start(?:@\w+)?\s*/i, '').trim();
+    if (startArg && (/^link_\d{6}$/i.test(startArg) || /^\d{6}$/.test(startArg))) {
+      const linked = await consumeTelegramLinkCode(env, startArg, tgFrom, chatId);
+      if (linked.ok && linked.user) {
+        await sendMessage(
+          token,
+          chatId,
+          `✅ *Telegram Account Linked Successfully!*\n\n` +
+            `• *Account:* *${linked.user.displayName}* (${linked.user.email})\n` +
+            `• *Role:* ${linked.user.role === 'admin' ? '🛡️ Project Admin' : '👷 Site Inspector'}\n\n` +
+            `You can now send site updates, photos, or browse rooms below:`,
+          { reply_markup: mainMenuKeyboard(linked.user.role === 'admin') }
+        );
+        return;
+      } else {
+        await sendMessage(
+          token,
+          chatId,
+          `⚠️ *Link Code Error:* ${linked.error || 'Invalid or expired code.'}`
+        );
+      }
+    } else if (startArg) {
+      const inv = await authenticateWithInviteCode(env, startArg, tgFrom, chatId);
+      if (inv.ok && inv.user) {
+        await sendMessage(
+          token,
+          chatId,
+          `✅ *Authenticated via Invitation Code!*\n\n` +
+            `• *Name:* *${inv.user.displayName}*\n` +
+            `• *Role:* ${inv.user.role === 'admin' ? '🛡️ Project Admin' : '👷 Site Inspector'}`,
+          { reply_markup: mainMenuKeyboard(inv.user.role === 'admin') }
+        );
+        return;
+      }
+    }
+  }
+
+  // 2. Command: /login <email> <password>
+  if (/^\/login(?:@\w+)?(\s|$)/i.test(text)) {
+    // Immediately delete the message containing the password for security
+    if (message.message_id) {
+      await deleteMessage(token, chatId, message.message_id).catch(() => {});
+    }
+    const args = text.replace(/^\/login(?:@\w+)?\s*/i, '').trim();
+    const spaceIdx = args.indexOf(' ');
+    if (!args || spaceIdx === -1) {
+      await sendMessage(
+        token,
+        chatId,
+        `🔑 *Sign In with ECIT Web App Account*\n\n` +
+          `Send your email and password in this format:\n` +
+          `\`/login engineer@saleh.com yourpassword\`\n\n` +
+          `_(Your message with the password will be automatically deleted immediately.)_`
+      );
+      return;
+    }
+    const email = args.slice(0, spaceIdx).trim();
+    const password = args.slice(spaceIdx + 1).trim();
+    const res = await authenticateWithSupabaseLogin(env, email, password, tgFrom, chatId);
+    if (res.ok && res.user) {
+      await sendMessage(
+        token,
+        chatId,
+        `✅ *Signed In & Linked Successfully!*\n\n` +
+          `• *Account:* *${res.user.displayName}* (\`${res.user.email}\`)\n` +
+          `• *Role:* ${res.user.role === 'admin' ? '🛡️ Project Admin' : '👷 Site Inspector'}\n\n` +
+          `Your password message was deleted for security. Use the menu below to get started:`,
+        { reply_markup: mainMenuKeyboard(res.user.role === 'admin') }
+      );
+    } else {
+      await sendMessage(
+        token,
+        chatId,
+        `❌ *Sign In Failed:* ${res.error || 'Invalid credentials.'}\n\n` +
+          `Please check your email and password, or generate a 6-digit Link Code in the [ECIT Web App](${WEB_APP_BASE}).`
+      );
+    }
+    return;
+  }
+
+  // 3. Command: /auth <link_code_or_invite_code>
+  if (/^\/auth(?:@\w+)?(\s|$)/i.test(text)) {
+    const codeArg = text.replace(/^\/auth(?:@\w+)?\s*/i, '').trim();
+    if (!codeArg) {
+      const existing = await getAuthorizedTelegramUser(env, tgUserId);
+      if (existing && existing.status === 'approved') {
+        const card = buildAccountCard(existing);
+        await sendMessage(token, chatId, card.text, { reply_markup: card.keyboard });
+      } else {
+        const card = buildAuthRequiredCard(tgFrom, existing);
+        await sendMessage(token, chatId, card.text, { reply_markup: card.keyboard });
+      }
+      return;
+    }
+
+    // Try 6-digit Web App link code first
+    const cleanedCode = codeArg.replace(/^link_/i, '').replace(/^TG-/i, '').trim();
+    if (/^\d{6}$/.test(cleanedCode)) {
+      const linked = await consumeTelegramLinkCode(env, cleanedCode, tgFrom, chatId);
+      if (linked.ok && linked.user) {
+        await sendMessage(
+          token,
+          chatId,
+          `✅ *Telegram Account Linked!*\n\n` +
+            `• *Account:* *${linked.user.displayName}* (\`${linked.user.email}\`)\n` +
+            `• *Role:* ${linked.user.role === 'admin' ? '🛡️ Project Admin' : '👷 Site Inspector'}`,
+          { reply_markup: mainMenuKeyboard(linked.user.role === 'admin') }
+        );
+      } else {
+        await sendMessage(
+          token,
+          chatId,
+          `❌ *Link Code Failed:* ${linked.error || 'Invalid or expired 6-digit code.'}`
+        );
+      }
+      return;
+    }
+
+    // Otherwise try Project Invitation Code
+    const inv = await authenticateWithInviteCode(env, codeArg, tgFrom, chatId);
+    if (inv.ok && inv.user) {
+      await sendMessage(
+        token,
+        chatId,
+        `✅ *Authenticated with Invitation Code!*\n\n` +
+          `• *Name:* *${inv.user.displayName}*\n` +
+          `• *Role:* ${inv.user.role === 'admin' ? '🛡️ Project Admin' : '👷 Site Inspector'}`,
+        { reply_markup: mainMenuKeyboard(inv.user.role === 'admin') }
+      );
+    } else {
+      await sendMessage(
+        token,
+        chatId,
+        `❌ *Invalid Code:* \`${codeArg}\` is not a valid 6-digit Web App Link Code or Project Invitation Code.`
+      );
+    }
+    return;
+  }
+
+  // 4. Command: /logout or /unlink
+  if (/^\/(logout|unlink)(?:@\w+)?(\s|$)/i.test(text)) {
+    const removed = await unlinkTelegramUser(env, { telegramUserId: tgUserId });
+    await sendMessage(
+      token,
+      chatId,
+      removed
+        ? `🔓 *Signed Out:* Your Telegram account has been unlinked from ECIT Site Tracker.`
+        : `ℹ️ Your Telegram account is not currently linked.`
+    );
+    return;
+  }
+
+  // 5. Check current user authorization status
+  let authUser = await getAuthorizedTelegramUser(env, tgUserId);
+
+  // If unauthenticated and user sent a raw 6-digit code or valid invite code directly, accept it!
+  if (!authUser || authUser.status !== 'approved') {
+    const rawTrimmed = text.replace(/^TG-/i, '').trim();
+    if (/^\d{6}$/.test(rawTrimmed)) {
+      const linked = await consumeTelegramLinkCode(env, rawTrimmed, tgFrom, chatId);
+      if (linked.ok && linked.user) {
+        await sendMessage(
+          token,
+          chatId,
+          `✅ *Telegram Account Linked!*\n\n` +
+            `• *Account:* *${linked.user.displayName}* (\`${linked.user.email}\`)\n` +
+            `• *Role:* ${linked.user.role === 'admin' ? '🛡️ Project Admin' : '👷 Site Inspector'}`,
+          { reply_markup: mainMenuKeyboard(linked.user.role === 'admin') }
+        );
+        return;
+      }
+    } else if (text && !text.startsWith('/')) {
+      const inv = await authenticateWithInviteCode(env, text, tgFrom, chatId);
+      if (inv.ok && inv.user) {
+        await sendMessage(
+          token,
+          chatId,
+          `✅ *Authenticated with Invitation Code!*\n\n` +
+            `• *Name:* *${inv.user.displayName}*\n` +
+            `• *Role:* ${inv.user.role === 'admin' ? '🛡️ Project Admin' : '👷 Site Inspector'}`,
+          { reply_markup: mainMenuKeyboard(inv.user.role === 'admin') }
+        );
+        return;
+      }
+    }
+
+    const card = buildAuthRequiredCard(tgFrom, authUser);
+    await sendMessage(token, chatId, card.text, { reply_markup: card.keyboard });
+    return;
+  }
+
+  const isAdmin = authUser.role === 'admin';
+  const authorLabel = formatTelegramAuthorLabel(authUser, tgFrom);
+
+  // Command: /whoami or /account
+  if (/^\/(whoami|account)(?:@\w+)?(\s|$)/i.test(text)) {
+    const card = buildAccountCard(authUser);
+    await sendMessage(token, chatId, card.text, { reply_markup: card.keyboard });
+    return;
+  }
+
+  // Command: /users (Admin only)
+  if (/^\/users(?:@\w+)?(\s|$)/i.test(text)) {
+    if (!isAdmin) {
+      await sendMessage(token, chatId, `⚠️ Only Project Admins can manage Telegram users.`);
+      return;
+    }
+    const card = await buildAdminUsersCard(env);
+    await sendMessage(token, chatId, card.text, { reply_markup: card.keyboard });
+    return;
+  }
 
   // Command: /start or /menu
   if (text.startsWith('/start') || text.startsWith('/menu')) {
     await setMyCommands(token).catch(() => {});
     const welcome =
-      `🏗️ *ECIT Site Tracker Assistant*\n\n` +
+      `🏗️ *ECIT Site Tracker Assistant*\n` +
+      `👤 Signed in as: *${authUser.displayName}* (${isAdmin ? '🛡️ Admin' : '👷 Inspector'})\n\n` +
       `Send site progress updates, photos, or snag reports naturally:\n` +
       `• \`F1-021 screed done\`\n` +
       `• \`GF-008 tiles ongoing\`\n` +
@@ -169,8 +688,9 @@ async function handleMessage(message: any, env: Env): Promise<void> {
       `• \`/status\` — Live project KPIs & floor progress\n` +
       `• \`/snags\` — View & resolve open snags across the site\n` +
       `• \`/room <code>\` — Open interactive room dashboard\n` +
-      `• \`/photos <code>\` — View stored room photos`;
-    await sendMessage(token, chatId, welcome, { reply_markup: mainMenuKeyboard() });
+      `• \`/photos <code>\` — View stored room photos\n` +
+      `• \`/whoami\` — View linked account & role`;
+    await sendMessage(token, chatId, welcome, { reply_markup: mainMenuKeyboard(isAdmin) });
     return;
   }
 
@@ -182,8 +702,8 @@ async function handleMessage(message: any, env: Env): Promise<void> {
       `2️⃣ *Snag Mode & Trades:* On any confirmation card, tap *⚠️ Log as Snag* to convert a photo/note into a Snag and choose its trade (\`Tile\`, \`Paint\`, \`MEP\`, etc.).\n` +
       `3️⃣ *Interactive Room Dashboard (\`/browse\` or \`/room\`):* Tap any finish button on a room card to cycle its status (\`Pending ➔ Ongoing ➔ Done\`) or close open snags with 1 tap.\n` +
       `4️⃣ *Undo Support:* Made a mistake? Tap *↩️ Undo Change* right after saving.\n` +
-      `5️⃣ *Reply Shortcut:* Reply directly to any Room card with a photo or note and the bot will automatically attach it to that room!`;
-    await sendMessage(token, chatId, help, { reply_markup: mainMenuKeyboard() });
+      `5️⃣ *Account & Security:* Use \`/whoami\` to view your linked ECIT account or \`/logout\` to unlink.`;
+    await sendMessage(token, chatId, help, { reply_markup: mainMenuKeyboard(isAdmin) });
     return;
   }
 
@@ -289,8 +809,8 @@ async function handleMessage(message: any, env: Env): Promise<void> {
     const pendingAction: PendingAction = {
       id: actionId,
       chatId,
-      telegramUserId: message.from?.id || 0,
-      telegramUsername: message.from?.username || message.from?.first_name,
+      telegramUserId: tgUserId,
+      telegramUsername: authorLabel,
       parsed,
       uiMode: 'auto',
       roomPage: 0,
@@ -948,7 +1468,8 @@ async function handleCallbackQuery(query: any, env: Env): Promise<void> {
   const message = query.message;
   const chatId = message?.chat?.id;
   const messageId = message?.message_id;
-  const authorName = query.from?.username || query.from?.first_name;
+  const tgFrom = query.from || { id: chatId, first_name: 'User' };
+  const tgUserId = Number(tgFrom.id || chatId);
 
   if (!data.includes(':')) {
     await answerCallbackQuery(token, query.id);
@@ -959,6 +1480,156 @@ async function handleCallbackQuery(query: any, env: Env): Promise<void> {
   const actionType = parts[0];
   const actionId = parts[1];
   const value = parts.slice(2).join(':');
+
+  // --- Access Request Callbacks (allowed before approval) ---
+  if (actionType === 'tg_req') {
+    if (actionId === 'ask') {
+      const { user, adminChatIds } = await requestTelegramAccess(env, tgFrom, chatId);
+      await answerCallbackQuery(token, query.id, 'Access request sent to Project Admins ✅');
+      const card = buildAuthRequiredCard(tgFrom, user);
+      if (chatId && messageId) {
+        await editMessageText(token, chatId, messageId, card.text, { reply_markup: card.keyboard });
+      }
+      // Notify any Telegram admins
+      const handle = user.telegramUsername ? `@${user.telegramUsername}` : `#${user.telegramUserId}`;
+      for (const adminChatId of adminChatIds) {
+        if (adminChatId === chatId) continue;
+        await sendMessage(
+          token,
+          adminChatId,
+          `🔔 *New Telegram Access Request*\n\n` +
+            `• *Name:* *${user.displayName}*\n` +
+            `• *Username:* ${handle}\n` +
+            `• *Telegram ID:* \`${user.telegramUserId}\`\n\n` +
+            `Approve or reject below:`,
+          {
+            reply_markup: {
+              inline_keyboard: [
+                [
+                  { text: '✅ Approve (Inspector)', callback_data: `tg_adm:app:${user.telegramUserId}` },
+                  { text: '🛡️ Approve (Admin)', callback_data: `tg_adm:adm:${user.telegramUserId}` }
+                ],
+                [
+                  { text: '🚫 Reject', callback_data: `tg_adm:rev:${user.telegramUserId}` }
+                ]
+              ]
+            }
+          }
+        ).catch(() => {});
+      }
+      return;
+    }
+
+    if (actionId === 'check') {
+      const current = await getAuthorizedTelegramUser(env, tgUserId);
+      if (current && current.status === 'approved') {
+        await answerCallbackQuery(token, query.id, 'Approved! Welcome ✅');
+        const card = buildAccountCard(current);
+        if (chatId && messageId) {
+          await editMessageText(token, chatId, messageId, card.text, { reply_markup: card.keyboard });
+        }
+      } else {
+        await answerCallbackQuery(token, query.id, 'Still pending Admin approval ⏳', true);
+      }
+      return;
+    }
+  }
+
+  // Enforce authentication for all other bot actions
+  const authUser = await getAuthorizedTelegramUser(env, tgUserId);
+  if (!authUser || authUser.status !== 'approved') {
+    await answerCallbackQuery(token, query.id, '🔒 Authentication required', true);
+    if (chatId) {
+      const card = buildAuthRequiredCard(tgFrom, authUser);
+      await sendMessage(token, chatId, card.text, { reply_markup: card.keyboard });
+    }
+    return;
+  }
+
+  const authorName = formatTelegramAuthorLabel(authUser, tgFrom);
+
+  // --- Account & Admin User Management Callbacks ---
+  if (actionType === 'tg_acc') {
+    await answerCallbackQuery(token, query.id);
+    const card = buildAccountCard(authUser);
+    if (chatId && messageId) {
+      await editMessageText(token, chatId, messageId, card.text, { reply_markup: card.keyboard });
+    }
+    return;
+  }
+
+  if (actionType === 'tg_unlk') {
+    await unlinkTelegramUser(env, { telegramUserId: tgUserId });
+    await answerCallbackQuery(token, query.id, 'Account unlinked 🔓');
+    if (chatId && messageId) {
+      const card = buildAuthRequiredCard(tgFrom, null);
+      await editMessageText(token, chatId, messageId, card.text, { reply_markup: card.keyboard });
+    }
+    return;
+  }
+
+  if (actionType === 'tg_adm') {
+    if (authUser.role !== 'admin') {
+      await answerCallbackQuery(token, query.id, 'Admin privileges required', true);
+      return;
+    }
+    if (actionId === 'list') {
+      await answerCallbackQuery(token, query.id);
+      const card = await buildAdminUsersCard(env);
+      if (chatId && messageId) {
+        await editMessageText(token, chatId, messageId, card.text, { reply_markup: card.keyboard });
+      }
+      return;
+    }
+
+    const targetId = Number(value);
+    if (!targetId) {
+      await answerCallbackQuery(token, query.id, 'Invalid user ID', true);
+      return;
+    }
+
+    const newStatus = actionId === 'rev' ? 'revoked' : 'approved';
+    const newRole = actionId === 'adm' ? 'admin' : 'inspector';
+    const updated = await setTelegramUserStatus(
+      env,
+      targetId,
+      newStatus,
+      newRole,
+      authUser.displayName || authorName
+    );
+    await answerCallbackQuery(
+      token,
+      query.id,
+      newStatus === 'revoked'
+        ? `Revoked #${targetId}`
+        : `Approved #${targetId} (${newRole.toUpperCase()})`
+    );
+
+    if (updated.chatId) {
+      if (newStatus === 'approved') {
+        await sendMessage(
+          token,
+          updated.chatId,
+          `🎉 *Access Approved!*\n\n` +
+            `Your Telegram account has been authorized for *ECIT Site Tracker*.\n` +
+            `• *Role:* ${newRole === 'admin' ? '🛡️ Project Admin' : '👷 Site Inspector'}`,
+          { reply_markup: mainMenuKeyboard(newRole === 'admin') }
+        ).catch(() => {});
+      } else {
+        await sendMessage(
+          token,
+          updated.chatId,
+          `🚫 Your Telegram access to *ECIT Site Tracker* has been revoked.`
+        ).catch(() => {});
+      }
+    }
+
+    const card = await buildAdminUsersCard(env);
+    if (chatId && messageId) {
+      await editMessageText(token, chatId, messageId, card.text, { reply_markup: card.keyboard });
+    }
+    return;
+  }
 
   // --- Interactive Browser & Stats Callbacks ---
   if (actionType === 'b_lvl') {

@@ -168,3 +168,34 @@ export interface Room {
   pinX?: number;
   pinY?: number;
 }
+
+export interface TelegramAuthorizedUser {
+  telegramUserId: number;
+  telegramUsername?: string;
+  firstName?: string;
+  lastName?: string;
+  chatId?: number;
+  status: 'approved' | 'pending' | 'revoked';
+  role: 'admin' | 'inspector';
+  authMethod: 'web_link' | 'supabase_login' | 'invite_code' | 'admin_approved';
+  supabaseUserId?: string;
+  email?: string;
+  displayName?: string;
+  linkedAt: string;
+  approvedBy?: string;
+}
+
+export interface TelegramLinkCode {
+  code: string;
+  supabaseUserId: string;
+  email: string;
+  displayName: string;
+  isAdmin: boolean;
+  createdAt: string;
+  expiresAt: string;
+}
+
+export interface TelegramAuthRegistry {
+  users: Record<string, TelegramAuthorizedUser>;
+  linkCodes: Record<string, TelegramLinkCode>;
+}

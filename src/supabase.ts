@@ -7,9 +7,33 @@ import type {
   RoomSnag,
   RoomLogEntry,
   RoomUndoSnapshot,
-  Status
+  Status,
+  TelegramAuthorizedUser,
+  TelegramLinkCode,
+  TelegramAuthRegistry
 } from './types';
 import { normalizeScheduleCodeInput } from './ai';
+
+export const TG_AUTH_REGISTRY_KEY = 'tg_auth_registry';
+
+export const VALID_INVITE_CODES = [
+  'ECIT2026',
+  'SALEH2026',
+  'SALEH-SITE',
+  'ECIT-ADMIN',
+  'DUBAI-SITE',
+  'SITE-ENGINEER'
+];
+
+export function formatAuthorTag(raw?: string): string {
+  if (!raw) return 'Telegram Bot';
+  const trimmed = raw.trim();
+  if (!trimmed) return 'Telegram Bot';
+  if (trimmed.includes(' ') || trimmed.includes('@') || trimmed.includes('(')) {
+    return trimmed;
+  }
+  return `@${trimmed}`;
+}
 
 export function getSupabase(env: Env): SupabaseClient {
   return createClient(env.SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY, {
@@ -599,7 +623,7 @@ export async function applyUpdateToRoom(
   }).catch(() => {});
 
   const nowIso = new Date().toISOString();
-  const author = telegramUsername ? `@${telegramUsername}` : 'Telegram Bot';
+  const author = formatAuthorTag(telegramUsername);
   const roomObj: Room = {
     ...targetRoom,
     checks: { ...(targetRoom.checks || {}) },
@@ -778,7 +802,7 @@ export async function quickCycleRoomFinish(
       id: 'l' + uid,
       ts: nowIso,
       text: `[Telegram] ${finishCode} (${finishCompactName(finishCode)}) → ${nextStatus.toUpperCase()}`,
-      by: authorName ? `@${authorName}` : 'Telegram Bot'
+      by: formatAuthorTag(authorName)
     },
     ...(room.log || [])
   ];
@@ -831,7 +855,7 @@ export async function closeRoomSnag(
       id: 'l' + uid,
       ts: nowIso,
       text: `[Telegram] Snag resolved: "${closedSnag.text}"`,
-      by: authorName ? `@${authorName}` : 'Telegram Bot'
+      by: formatAuthorTag(authorName)
     },
     ...(room.log || [])
   ];
@@ -945,4 +969,395 @@ export async function getRoomsWithOpenSnags(env: Env): Promise<Room[]> {
       if (sbCount !== sa) return sbCount - sa;
       return a.level - b.level;
     });
+}
+
+// ================= TELEGRAM USER AUTHENTICATION & LINKING =================
+
+export async function getTelegramAuthRegistry(env: Env): Promise<TelegramAuthRegistry> {
+  const sb = getSupabase(env);
+  try {
+    const { data, error } = await sb
+      .from('kv')
+      .select('v')
+      .eq('k', TG_AUTH_REGISTRY_KEY)
+      .maybeSingle();
+    if (error || !data || !data.v) {
+      return { users: {}, linkCodes: {} };
+    }
+    const raw = data.v as Partial<TelegramAuthRegistry>;
+    const users = raw.users && typeof raw.users === 'object' ? { ...raw.users } : {};
+    const linkCodes = raw.linkCodes && typeof raw.linkCodes === 'object' ? { ...raw.linkCodes } : {};
+
+    // Prune expired link codes
+    const now = Date.now();
+    for (const [code, item] of Object.entries(linkCodes)) {
+      if (!item || new Date(item.expiresAt).getTime() < now) {
+        delete linkCodes[code];
+      }
+    }
+    return { users, linkCodes };
+  } catch (e) {
+    console.warn('getTelegramAuthRegistry warning:', e);
+    return { users: {}, linkCodes: {} };
+  }
+}
+
+export async function saveTelegramAuthRegistry(
+  env: Env,
+  registry: TelegramAuthRegistry
+): Promise<void> {
+  const sb = getSupabase(env);
+  const { error } = await sb.from('kv').upsert(
+    {
+      k: TG_AUTH_REGISTRY_KEY,
+      v: registry,
+      updated: new Date().toISOString()
+    },
+    { onConflict: 'k' }
+  );
+  if (error) {
+    console.error('Failed to save Telegram auth registry:', error);
+    throw error;
+  }
+}
+
+export async function getAuthorizedTelegramUser(
+  env: Env,
+  telegramUserId?: number
+): Promise<TelegramAuthorizedUser | null> {
+  if (!telegramUserId) return null;
+  const reg = await getTelegramAuthRegistry(env);
+  return reg.users[String(telegramUserId)] || null;
+}
+
+export function formatTelegramAuthorLabel(
+  authUser: TelegramAuthorizedUser | null,
+  from?: { id?: number; username?: string; first_name?: string; last_name?: string }
+): string {
+  if (authUser?.displayName) {
+    const handle = from?.username || authUser.telegramUsername;
+    return handle ? `${authUser.displayName} (@${handle})` : authUser.displayName;
+  }
+  if (from?.username) return `@${from.username}`;
+  if (from?.first_name) {
+    return [from.first_name, from.last_name].filter(Boolean).join(' ');
+  }
+  return 'Telegram User';
+}
+
+export async function generateTelegramLinkCode(
+  env: Env,
+  input: {
+    supabaseUserId: string;
+    email: string;
+    displayName: string;
+    isAdmin: boolean;
+  }
+): Promise<TelegramLinkCode> {
+  const reg = await getTelegramAuthRegistry(env);
+
+  // Remove any previous active link codes for the same Supabase user
+  for (const [k, v] of Object.entries(reg.linkCodes)) {
+    if (v.supabaseUserId === input.supabaseUserId) {
+      delete reg.linkCodes[k];
+    }
+  }
+
+  // Generate a 6-digit numeric pairing code
+  const num = Math.floor(100000 + Math.random() * 900000);
+  const code = String(num);
+  const now = new Date();
+  const expires = new Date(now.getTime() + 15 * 60 * 1000); // 15 minutes
+
+  const entry: TelegramLinkCode = {
+    code,
+    supabaseUserId: input.supabaseUserId,
+    email: input.email,
+    displayName: input.displayName,
+    isAdmin: input.isAdmin,
+    createdAt: now.toISOString(),
+    expiresAt: expires.toISOString()
+  };
+
+  reg.linkCodes[code] = entry;
+  await saveTelegramAuthRegistry(env, reg);
+  return entry;
+}
+
+export async function consumeTelegramLinkCode(
+  env: Env,
+  rawCode: string,
+  tgUser: { id: number; username?: string; first_name?: string; last_name?: string },
+  chatId?: number
+): Promise<{ ok: boolean; user?: TelegramAuthorizedUser; error?: string }> {
+  const clean = rawCode.trim().replace(/^link_/i, '').replace(/^TG-/i, '').trim();
+  const reg = await getTelegramAuthRegistry(env);
+  const link = reg.linkCodes[clean];
+
+  if (!link) {
+    return { ok: false, error: 'Invalid or expired link code.' };
+  }
+  if (new Date(link.expiresAt).getTime() < Date.now()) {
+    delete reg.linkCodes[clean];
+    await saveTelegramAuthRegistry(env, reg);
+    return { ok: false, error: 'This link code has expired. Please generate a new one in the Web App.' };
+  }
+
+  const userEntry: TelegramAuthorizedUser = {
+    telegramUserId: tgUser.id,
+    telegramUsername: tgUser.username,
+    firstName: tgUser.first_name,
+    lastName: tgUser.last_name,
+    chatId: chatId || tgUser.id,
+    status: 'approved',
+    role: link.isAdmin ? 'admin' : 'inspector',
+    authMethod: 'web_link',
+    supabaseUserId: link.supabaseUserId,
+    email: link.email,
+    displayName: link.displayName,
+    linkedAt: new Date().toISOString()
+  };
+
+  reg.users[String(tgUser.id)] = userEntry;
+  delete reg.linkCodes[clean];
+  await saveTelegramAuthRegistry(env, reg);
+  return { ok: true, user: userEntry };
+}
+
+export async function authenticateWithInviteCode(
+  env: Env,
+  rawCode: string,
+  tgUser: { id: number; username?: string; first_name?: string; last_name?: string },
+  chatId?: number
+): Promise<{ ok: boolean; user?: TelegramAuthorizedUser }> {
+  const clean = rawCode.trim().toUpperCase();
+  if (!VALID_INVITE_CODES.includes(clean)) {
+    return { ok: false };
+  }
+
+  const reg = await getTelegramAuthRegistry(env);
+  const existing = reg.users[String(tgUser.id)];
+  const fullName =
+    [tgUser.first_name, tgUser.last_name].filter(Boolean).join(' ') ||
+    tgUser.username ||
+    `Telegram #${tgUser.id}`;
+
+  const isInviteAdmin = clean === 'ECIT-ADMIN';
+  const userEntry: TelegramAuthorizedUser = {
+    telegramUserId: tgUser.id,
+    telegramUsername: tgUser.username,
+    firstName: tgUser.first_name,
+    lastName: tgUser.last_name,
+    chatId: chatId || tgUser.id,
+    status: 'approved',
+    role: isInviteAdmin || existing?.role === 'admin' ? 'admin' : 'inspector',
+    authMethod: 'invite_code',
+    supabaseUserId: existing?.supabaseUserId,
+    email: existing?.email,
+    displayName: existing?.displayName || fullName,
+    linkedAt: new Date().toISOString()
+  };
+
+  reg.users[String(tgUser.id)] = userEntry;
+  await saveTelegramAuthRegistry(env, reg);
+  return { ok: true, user: userEntry };
+}
+
+export async function verifySupabaseUserFromToken(
+  env: Env,
+  accessToken: string
+): Promise<{ id: string; email: string; displayName: string; isAdmin: boolean } | null> {
+  if (!accessToken) return null;
+  const sb = getSupabase(env);
+  try {
+    const { data, error } = await sb.auth.getUser(accessToken);
+    if (error || !data?.user || data.user.is_anonymous) return null;
+    const u = data.user;
+    const displayName =
+      u.user_metadata?.display_name ||
+      u.email?.split('@')[0] ||
+      u.email ||
+      'ECIT User';
+
+    let isAdmin =
+      u.app_metadata?.is_room_admin === true ||
+      u.app_metadata?.is_admin === true ||
+      String(u.app_metadata?.role || '').toLowerCase() === 'admin';
+
+    if (!isAdmin) {
+      try {
+        const userClient = createClient(env.SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY, {
+          auth: { persistSession: false, autoRefreshToken: false },
+          global: {
+            headers: {
+              Authorization: `Bearer ${accessToken}`
+            }
+          }
+        });
+        const { data: rpcAdmin } = await userClient.rpc('is_room_admin');
+        if (rpcAdmin === true) {
+          isAdmin = true;
+        }
+      } catch {
+        // ignore
+      }
+    }
+
+    return {
+      id: u.id,
+      email: u.email || '',
+      displayName,
+      isAdmin
+    };
+  } catch {
+    return null;
+  }
+}
+
+export async function authenticateWithSupabaseLogin(
+  env: Env,
+  email: string,
+  password: string,
+  tgUser: { id: number; username?: string; first_name?: string; last_name?: string },
+  chatId?: number
+): Promise<{ ok: boolean; user?: TelegramAuthorizedUser; error?: string }> {
+  try {
+    const sb = createClient(env.SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY, {
+      auth: { persistSession: false, autoRefreshToken: false }
+    });
+    const { data, error } = await sb.auth.signInWithPassword({
+      email: email.trim(),
+      password
+    });
+    if (error || !data?.user || !data?.session) {
+      return { ok: false, error: error?.message || 'Invalid email or password' };
+    }
+
+    const verified = await verifySupabaseUserFromToken(env, data.session.access_token);
+    const u = data.user;
+    const displayName =
+      verified?.displayName ||
+      u.user_metadata?.display_name ||
+      u.email?.split('@')[0] ||
+      'ECIT User';
+    const isAdmin = verified?.isAdmin === true;
+
+    const reg = await getTelegramAuthRegistry(env);
+    const userEntry: TelegramAuthorizedUser = {
+      telegramUserId: tgUser.id,
+      telegramUsername: tgUser.username,
+      firstName: tgUser.first_name,
+      lastName: tgUser.last_name,
+      chatId: chatId || tgUser.id,
+      status: 'approved',
+      role: isAdmin ? 'admin' : 'inspector',
+      authMethod: 'supabase_login',
+      supabaseUserId: u.id,
+      email: u.email || email.trim(),
+      displayName,
+      linkedAt: new Date().toISOString()
+    };
+
+    reg.users[String(tgUser.id)] = userEntry;
+    await saveTelegramAuthRegistry(env, reg);
+    return { ok: true, user: userEntry };
+  } catch (e: any) {
+    return { ok: false, error: e?.message || 'Authentication failed' };
+  }
+}
+
+export async function requestTelegramAccess(
+  env: Env,
+  tgUser: { id: number; username?: string; first_name?: string; last_name?: string },
+  chatId?: number
+): Promise<{ user: TelegramAuthorizedUser; adminChatIds: number[] }> {
+  const reg = await getTelegramAuthRegistry(env);
+  const existing = reg.users[String(tgUser.id)];
+  const fullName =
+    [tgUser.first_name, tgUser.last_name].filter(Boolean).join(' ') ||
+    tgUser.username ||
+    `Telegram #${tgUser.id}`;
+
+  const entry: TelegramAuthorizedUser = existing
+    ? {
+        ...existing,
+        telegramUsername: tgUser.username || existing.telegramUsername,
+        firstName: tgUser.first_name || existing.firstName,
+        lastName: tgUser.last_name || existing.lastName,
+        chatId: chatId || existing.chatId || tgUser.id,
+        status: existing.status === 'approved' ? 'approved' : 'pending'
+      }
+    : {
+        telegramUserId: tgUser.id,
+        telegramUsername: tgUser.username,
+        firstName: tgUser.first_name,
+        lastName: tgUser.last_name,
+        chatId: chatId || tgUser.id,
+        status: 'pending',
+        role: 'inspector',
+        authMethod: 'admin_approved',
+        displayName: fullName,
+        linkedAt: new Date().toISOString()
+      };
+
+  reg.users[String(tgUser.id)] = entry;
+  await saveTelegramAuthRegistry(env, reg);
+
+  const adminChatIds = Object.values(reg.users)
+    .filter(u => u.status === 'approved' && u.role === 'admin' && u.chatId)
+    .map(u => u.chatId!);
+
+  return { user: entry, adminChatIds };
+}
+
+export async function setTelegramUserStatus(
+  env: Env,
+  targetTelegramId: number,
+  status: 'approved' | 'revoked' | 'pending',
+  role: 'admin' | 'inspector',
+  approvedBy: string,
+  extra?: { displayName?: string; telegramUsername?: string }
+): Promise<TelegramAuthorizedUser> {
+  const reg = await getTelegramAuthRegistry(env);
+  const existing = reg.users[String(targetTelegramId)];
+  const updated: TelegramAuthorizedUser = {
+    telegramUserId: targetTelegramId,
+    telegramUsername: extra?.telegramUsername || existing?.telegramUsername,
+    firstName: existing?.firstName,
+    lastName: existing?.lastName,
+    chatId: existing?.chatId || targetTelegramId,
+    status,
+    role,
+    authMethod: existing?.authMethod || 'admin_approved',
+    supabaseUserId: existing?.supabaseUserId,
+    email: existing?.email,
+    displayName: extra?.displayName || existing?.displayName || `Telegram #${targetTelegramId}`,
+    linkedAt: existing?.linkedAt || new Date().toISOString(),
+    approvedBy
+  };
+
+  reg.users[String(targetTelegramId)] = updated;
+  await saveTelegramAuthRegistry(env, reg);
+  return updated;
+}
+
+export async function unlinkTelegramUser(
+  env: Env,
+  opts: { telegramUserId?: number; supabaseUserId?: string }
+): Promise<number> {
+  const reg = await getTelegramAuthRegistry(env);
+  let removed = 0;
+  for (const [k, u] of Object.entries(reg.users)) {
+    if (
+      (opts.telegramUserId && u.telegramUserId === opts.telegramUserId) ||
+      (opts.supabaseUserId && u.supabaseUserId === opts.supabaseUserId)
+    ) {
+      delete reg.users[k];
+      removed++;
+    }
+  }
+  if (removed > 0) {
+    await saveTelegramAuthRegistry(env, reg);
+  }
+  return removed;
 }

@@ -143,6 +143,28 @@ export async function answerCallbackQuery(
   });
 }
 
+export async function deleteMessage(
+  botToken: string,
+  chatId: number | string,
+  messageId: number
+): Promise<boolean> {
+  try {
+    const url = `${TELEGRAM_API_BASE}/bot${botToken}/deleteMessage`;
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: chatId,
+        message_id: messageId
+      })
+    });
+    const data: any = await res.json();
+    return !!data?.ok;
+  } catch {
+    return false;
+  }
+}
+
 export async function setMyCommands(botToken: string): Promise<any> {
   const url = `${TELEGRAM_API_BASE}/bot${botToken}/setMyCommands`;
   const commands = [
@@ -151,6 +173,10 @@ export async function setMyCommands(botToken: string): Promise<any> {
     { command: 'snags', description: '⚠️ View & resolve open snags across site' },
     { command: 'room', description: '🚪 Inspect a room by code (e.g. /room F1-021)' },
     { command: 'photos', description: '🖼️ View stored photos for a room' },
+    { command: 'auth', description: '🔐 Authenticate with Link Code or Invite Code' },
+    { command: 'login', description: '🔑 Sign in with Web App email & password' },
+    { command: 'whoami', description: '👤 View linked account & role' },
+    { command: 'users', description: '🛡️ Manage authorized Telegram users (Admin)' },
     { command: 'help', description: '📖 Bot usage guide & examples' }
   ];
   const res = await fetch(url, {
