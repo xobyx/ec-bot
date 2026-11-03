@@ -10,7 +10,8 @@ import type {
   Status,
   TelegramAuthorizedUser,
   TelegramLinkCode,
-  TelegramAuthRegistry
+  TelegramAuthRegistry,
+  WebSiteUser
 } from './types';
 import { normalizeScheduleCodeInput } from './ai';
 
@@ -1360,4 +1361,192 @@ export async function unlinkTelegramUser(
     await saveTelegramAuthRegistry(env, reg);
   }
   return removed;
+}
+
+// ================= WEBSITE USERS MANAGEMENT (SUPABASE AUTH ADMIN) =================
+
+function mapAuthUserToWebSiteUser(
+  u: any,
+  tgUsers: TelegramAuthorizedUser[]
+): WebSiteUser {
+  const displayName =
+    u.user_metadata?.display_name ||
+    u.email?.split('@')[0] ||
+    u.email ||
+    'User';
+  const rawInvite =
+    u.user_metadata?.invite_code ||
+    u.user_metadata?.invitation_code ||
+    '';
+  const inviteCode = rawInvite && rawInvite.length <= 24 ? rawInvite : rawInvite ? 'TOKEN' : '';
+
+  const isAdmin =
+    u.app_metadata?.is_room_admin === true ||
+    u.app_metadata?.is_admin === true ||
+    String(u.app_metadata?.role || '').toLowerCase() === 'admin';
+
+  const bannedUntil = u.banned_until || null;
+  const isBanned =
+    !!bannedUntil &&
+    bannedUntil !== 'none' &&
+    new Date(bannedUntil).getTime() > Date.now();
+
+  const linkedTg = tgUsers.find(
+    t =>
+      t.supabaseUserId === u.id ||
+      (u.email && t.email && t.email.toLowerCase() === u.email.toLowerCase())
+  );
+
+  return {
+    id: u.id,
+    email: u.email || '',
+    displayName,
+    inviteCode,
+    isAdmin,
+    isBanned,
+    bannedUntil,
+    createdAt: u.created_at || '',
+    lastSignInAt: u.last_sign_in_at || null,
+    linkedTelegram: linkedTg
+      ? {
+          telegramUserId: linkedTg.telegramUserId,
+          telegramUsername: linkedTg.telegramUsername,
+          status: linkedTg.status
+        }
+      : null
+  };
+}
+
+export async function listRegisteredWebUsers(env: Env): Promise<WebSiteUser[]> {
+  const sb = getSupabase(env);
+  const [{ data, error }, reg] = await Promise.all([
+    sb.auth.admin.listUsers({ page: 1, perPage: 200 }),
+    getTelegramAuthRegistry(env)
+  ]);
+  if (error) throw error;
+  const tgList = Object.values(reg.users);
+  return (data?.users || [])
+    .filter((u: any) => !u.is_anonymous && u.email)
+    .map((u: any) => mapAuthUserToWebSiteUser(u, tgList))
+    .sort((a, b) => {
+      if (a.isAdmin !== b.isAdmin) return a.isAdmin ? -1 : 1;
+      return (b.lastSignInAt || b.createdAt || '').localeCompare(a.lastSignInAt || a.createdAt || '');
+    });
+}
+
+export async function adminCreateWebUser(
+  env: Env,
+  input: {
+    email: string;
+    password: string;
+    displayName?: string;
+    role?: 'admin' | 'inspector';
+  }
+): Promise<WebSiteUser> {
+  const sb = getSupabase(env);
+  const email = input.email.trim();
+  const displayName = (input.displayName || '').trim() || email.split('@')[0];
+  const isAdmin = input.role === 'admin';
+
+  const { data, error } = await sb.auth.admin.createUser({
+    email,
+    password: input.password,
+    email_confirm: true,
+    user_metadata: {
+      display_name: displayName,
+      invite_code: 'ADMIN-CREATED'
+    },
+    app_metadata: {
+      is_room_admin: isAdmin,
+      role: isAdmin ? 'admin' : 'inspector'
+    }
+  });
+  if (error || !data?.user) {
+    throw error || new Error('Failed to create user');
+  }
+  const reg = await getTelegramAuthRegistry(env);
+  return mapAuthUserToWebSiteUser(data.user, Object.values(reg.users));
+}
+
+export async function adminUpdateWebUser(
+  env: Env,
+  input: {
+    userId: string;
+    displayName?: string;
+    password?: string;
+    role?: 'admin' | 'inspector';
+    banned?: boolean;
+  }
+): Promise<WebSiteUser> {
+  const sb = getSupabase(env);
+  const { data: existingData, error: getErr } = await sb.auth.admin.getUserById(input.userId);
+  if (getErr || !existingData?.user) {
+    throw getErr || new Error('User not found');
+  }
+  const existing = existingData.user;
+  const attrs: any = {};
+
+  if (typeof input.displayName === 'string' && input.displayName.trim()) {
+    attrs.user_metadata = {
+      ...(existing.user_metadata || {}),
+      display_name: input.displayName.trim()
+    };
+  }
+
+  if (input.role === 'admin' || input.role === 'inspector') {
+    const makeAdmin = input.role === 'admin';
+    attrs.app_metadata = {
+      ...(existing.app_metadata || {}),
+      is_room_admin: makeAdmin,
+      role: makeAdmin ? 'admin' : 'inspector'
+    };
+  }
+
+  if (typeof input.password === 'string' && input.password.trim().length >= 6) {
+    attrs.password = input.password.trim();
+  }
+
+  if (typeof input.banned === 'boolean') {
+    attrs.ban_duration = input.banned ? '876000h' : 'none';
+  }
+
+  const { data: updatedData, error: upErr } = await sb.auth.admin.updateUserById(input.userId, attrs);
+  if (upErr || !updatedData?.user) {
+    throw upErr || new Error('Failed to update user');
+  }
+
+  // Sync linked Telegram user if any
+  const reg = await getTelegramAuthRegistry(env);
+  let regChanged = false;
+  for (const tg of Object.values(reg.users)) {
+    if (
+      tg.supabaseUserId === input.userId ||
+      (existing.email && tg.email && tg.email.toLowerCase() === existing.email.toLowerCase())
+    ) {
+      if (typeof input.displayName === 'string' && input.displayName.trim()) {
+        tg.displayName = input.displayName.trim();
+        regChanged = true;
+      }
+      if (input.role === 'admin' || input.role === 'inspector') {
+        tg.role = input.role;
+        regChanged = true;
+      }
+      if (typeof input.banned === 'boolean') {
+        tg.status = input.banned ? 'revoked' : 'approved';
+        regChanged = true;
+      }
+    }
+  }
+  if (regChanged) {
+    await saveTelegramAuthRegistry(env, reg);
+  }
+
+  return mapAuthUserToWebSiteUser(updatedData.user, Object.values(reg.users));
+}
+
+export async function adminDeleteWebUser(env: Env, userId: string): Promise<void> {
+  const sb = getSupabase(env);
+  const { error } = await sb.auth.admin.deleteUser(userId);
+  if (error) throw error;
+  await unlinkTelegramUser(env, { supabaseUserId: userId });
 }

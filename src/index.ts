@@ -51,7 +51,11 @@ import {
   verifySupabaseUserFromToken,
   requestTelegramAccess,
   setTelegramUserStatus,
-  unlinkTelegramUser
+  unlinkTelegramUser,
+  listRegisteredWebUsers,
+  adminCreateWebUser,
+  adminUpdateWebUser,
+  adminDeleteWebUser
 } from './supabase';
 
 const WEB_APP_BASE = 'https://ecit-tracker.pages.dev';
@@ -156,12 +160,97 @@ async function handleWebTelegramAuthApi(request: Request, env: Env): Promise<Res
           (webUser.email && u.email && u.email.toLowerCase() === webUser.email.toLowerCase())
       );
       const activeCode = Object.values(reg.linkCodes).find(c => c.supabaseUserId === webUser.id) || null;
+      const webUsers = webUser.isAdmin ? await listRegisteredWebUsers(env).catch(() => []) : undefined;
       return jsonResponse({
         ok: true,
         botUsername: BOT_USERNAME,
         linkedUsers,
         activeCode,
-        allUsers: webUser.isAdmin ? allList : undefined
+        allUsers: webUser.isAdmin ? allList : undefined,
+        webUsers
+      });
+    }
+
+    if (action === 'admin_list_web_users') {
+      if (!webUser.isAdmin) {
+        return jsonResponse({ ok: false, error: 'Admin privileges required' }, 403);
+      }
+      const webUsers = await listRegisteredWebUsers(env);
+      return jsonResponse({ ok: true, webUsers });
+    }
+
+    if (action === 'admin_create_web_user') {
+      if (!webUser.isAdmin) {
+        return jsonResponse({ ok: false, error: 'Admin privileges required' }, 403);
+      }
+      if (!body.email || !body.password) {
+        return jsonResponse({ ok: false, error: 'Email and password are required' }, 400);
+      }
+      const created = await adminCreateWebUser(env, {
+        email: String(body.email),
+        password: String(body.password),
+        displayName: body.displayName ? String(body.displayName) : undefined,
+        role: body.role === 'admin' ? 'admin' : 'inspector'
+      });
+      const webUsers = await listRegisteredWebUsers(env);
+      return jsonResponse({ ok: true, user: created, webUsers });
+    }
+
+    if (action === 'admin_update_web_user') {
+      if (!webUser.isAdmin) {
+        return jsonResponse({ ok: false, error: 'Admin privileges required' }, 403);
+      }
+      const targetUserId = String(body.userId || '').trim();
+      if (!targetUserId) {
+        return jsonResponse({ ok: false, error: 'Missing userId' }, 400);
+      }
+      if (targetUserId === webUser.id) {
+        if (body.banned === true) {
+          return jsonResponse({ ok: false, error: 'You cannot suspend your own Admin account' }, 400);
+        }
+        if (body.role === 'inspector') {
+          return jsonResponse({ ok: false, error: 'You cannot demote your own Admin account' }, 400);
+        }
+      }
+      const updated = await adminUpdateWebUser(env, {
+        userId: targetUserId,
+        displayName: body.displayName,
+        password: body.password,
+        role: body.role,
+        banned: body.banned
+      });
+      const reg = await getTelegramAuthRegistry(env);
+      const webUsers = await listRegisteredWebUsers(env);
+      return jsonResponse({
+        ok: true,
+        user: updated,
+        webUsers,
+        allUsers: Object.values(reg.users).sort((a, b) =>
+          (b.linkedAt || '').localeCompare(a.linkedAt || '')
+        )
+      });
+    }
+
+    if (action === 'admin_delete_web_user') {
+      if (!webUser.isAdmin) {
+        return jsonResponse({ ok: false, error: 'Admin privileges required' }, 403);
+      }
+      const targetUserId = String(body.userId || '').trim();
+      if (!targetUserId) {
+        return jsonResponse({ ok: false, error: 'Missing userId' }, 400);
+      }
+      if (targetUserId === webUser.id) {
+        return jsonResponse({ ok: false, error: 'You cannot delete your own Admin account' }, 400);
+      }
+      await adminDeleteWebUser(env, targetUserId);
+      const reg = await getTelegramAuthRegistry(env);
+      const webUsers = await listRegisteredWebUsers(env);
+      return jsonResponse({
+        ok: true,
+        webUsers,
+        allUsers: Object.values(reg.users).sort((a, b) =>
+          (b.linkedAt || '').localeCompare(a.linkedAt || '')
+        )
       });
     }
 

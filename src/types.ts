@@ -199,3 +199,20 @@ export interface TelegramAuthRegistry {
   users: Record<string, TelegramAuthorizedUser>;
   linkCodes: Record<string, TelegramLinkCode>;
 }
+
+export interface WebSiteUser {
+  id: string;
+  email: string;
+  displayName: string;
+  inviteCode?: string;
+  isAdmin: boolean;
+  isBanned: boolean;
+  bannedUntil?: string | null;
+  createdAt: string;
+  lastSignInAt?: string | null;
+  linkedTelegram?: {
+    telegramUserId: number;
+    telegramUsername?: string;
+    status: string;
+  } | null;
+}
