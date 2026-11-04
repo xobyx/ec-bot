@@ -240,7 +240,7 @@ async function analyzeWithWorkersAI(
     }
 
     const responseText = result?.response || (typeof result === 'string' ? result : JSON.stringify(result));
-    return parseCleanJson(responseText, text, undefined, microLib);
+    return parseCleanJson(responseText, text, undefined, microLib, 'Cloudflare AI');
   } catch (err: any) {
     console.error('Workers AI execution error:', err);
     return fallbackHeuristicParser(text, microLib);
@@ -273,7 +273,7 @@ async function analyzeWithGemini(
     });
   }
 
-  const models = ['gemini-2.0-flash', 'gemini-3.1-flash-lite', 'gemini-1.5-flash'];
+  const models = ['gemini-3.1-flash-lite', 'gemini-2.0-flash', 'gemini-1.5-flash'];
   let lastErr: any = null;
 
   for (const model of models) {
@@ -293,7 +293,7 @@ async function analyzeWithGemini(
     if (res.ok) {
       const data: any = await res.json();
       const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
-      return parseCleanJson(rawText, text, data, microLib);
+      return parseCleanJson(rawText, text, data, microLib, 'Gemini');
     }
     lastErr = new Error(`Gemini API error (${model}): ${res.status} ${await res.text()}`);
   }
@@ -305,7 +305,8 @@ function parseCleanJson(
   raw: string,
   fallbackText: string,
   org?: any,
-  microLib?: MicroTaskLibrary
+  microLib?: MicroTaskLibrary,
+  aiEngine = 'AI'
 ): ParsedSiteUpdate {
   try {
     const cleaned = raw.replace(/^```json/im, '').replace(/^```/im, '').replace(/```$/m, '').trim();
@@ -360,6 +361,7 @@ function parseCleanJson(
       notes: parsed.notes || fallbackText,
       summary: parsed.summary || heuristic.summary || 'Site update parsed',
       microTask,
+      aiEngine,
       orginal: org
     };
   } catch (e) {
@@ -535,6 +537,7 @@ export function fallbackHeuristicParser(
     status,
     snag,
     microTask,
+    aiEngine: 'Heuristic',
     notes: text,
     summary: `${spaceTitle}${targetDesc}${status ? ` → ${status.toUpperCase()}` : ''}`
   };

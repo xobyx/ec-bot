@@ -101,7 +101,8 @@ export interface ParsedSiteUpdate {
     id: string;
     name: string;
   } | null;
-    orginal?:any
+  aiEngine?: string;
+  orginal?: any;
 }
 
 

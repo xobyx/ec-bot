@@ -1386,6 +1386,13 @@ async function buildInteractivePrompt(
     ? `• *Prep Step:* 🔧 "${parsed.microTask.name}"${parsed.finishCode ? ` [${parsed.finishCode}]` : ''} ➔ *${(parsed.status || 'done').toUpperCase()}*\n`
     : '';
   const notesLine = parsed.notes ? `• *Note:* _${parsed.notes}_\n` : '';
+  const engineLabel =
+    parsed.aiEngine === 'Gemini'
+      ? '✨ Gemini'
+      : parsed.aiEngine === 'Cloudflare AI'
+        ? '☁️ Cloudflare AI'
+        : '⚡ Heuristic';
+  const engineLine = `• *Parser:* *${engineLabel}*\n`;
 
   let mode = action.uiMode || 'auto';
   if (mode === 'auto') {
@@ -1404,6 +1411,7 @@ async function buildInteractivePrompt(
   if (mode === 'pick_level') {
     const text =
       `🏢 *Select Level (Floor)*\n\n` +
+      engineLine +
       `• *Detected Space:* ${parsed.spaceCode || parsed.space || 'Unspecified'}\n` +
       (parsed.finishCode
         ? `• *Finish:* ${formatFinishLine(parsed.finishCode)} ${parsed.status ? `➔ *${parsed.status.toUpperCase()}*` : ''}\n`
@@ -1439,6 +1447,7 @@ async function buildInteractivePrompt(
   if (mode === 'pick_zone') {
     const text =
       `🗺️ *Select Zone on ${levelStr}*\n\n` +
+      engineLine +
       `• *Level:* *${levelStr}*\n` +
       `• *Detected Space:* ${parsed.spaceCode || parsed.space || 'Unspecified'}\n` +
       (parsed.finishCode
@@ -1485,6 +1494,7 @@ async function buildInteractivePrompt(
 
     const text =
       `🚪 *Select Room (${levelStr} · ${zoneStr})*\n\n` +
+      engineLine +
       (parsed.space ? `• *Searched Space:* \`${parsed.space}\`\n` : '') +
       (parsed.finishCode
         ? `• *Finish:* ${formatFinishLine(parsed.finishCode)} ${parsed.status ? `➔ *${parsed.status.toUpperCase()}*` : ''}\n`
@@ -1662,6 +1672,7 @@ async function buildInteractivePrompt(
 
   const text =
     `📋 *Confirm Room Update*\n\n` +
+    engineLine +
     `• *Room:* *${roomLabel}*\n` +
     `• *Current Finishes:*\n${checksSummary}\n` +
     `• *${parsed.microTask ? 'Prep Update' : 'Finish Update'}:* ${updateTargetDisplay}\n` +
