@@ -239,8 +239,10 @@ async function analyzeWithWorkersAI(
       });
     }
 
-    const responseText = result?.response || (typeof result === 'string' ? result : JSON.stringify(result));
-    return parseCleanJson(responseText, text, undefined, microLib, 'Cloudflare AI');
+    const rawResp = result?.response ?? result;
+    const responseText =
+      typeof rawResp === 'string' ? rawResp : JSON.stringify(rawResp || {});
+    return parseCleanJson(responseText, text, result, microLib, 'Cloudflare AI');
   } catch (err: any) {
     console.error('Workers AI execution error:', err);
     return fallbackHeuristicParser(text, microLib);
@@ -273,32 +275,58 @@ async function analyzeWithGemini(
     });
   }
 
-  const models = ['gemini-3.1-flash-lite', 'gemini-2.0-flash', 'gemini-1.5-flash'];
+  const models = [
+    'gemini-2.5-flash-lite',
+    'gemini-flash-lite-latest',
+    'gemini-3.1-flash-lite',
+    'gemini-2.5-flash'
+  ];
   let lastErr: any = null;
 
   for (const model of models) {
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        contents: [{ parts }],
-        generationConfig: {
-          temperature: 0.1,
-          response_mime_type: 'application/json'
-        }
-      })
-    });
+    try {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts }],
+          generationConfig: {
+            temperature: 0.1,
+            response_mime_type: 'application/json'
+          }
+        })
+      });
 
-    if (res.ok) {
-      const data: any = await res.json();
-      const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
-      return parseCleanJson(rawText, text, data, microLib, 'Gemini');
+      if (res.ok) {
+        const data: any = await res.json();
+        const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
+        return parseCleanJson(rawText, text, data, microLib, `Gemini (${model})`);
+      }
+      lastErr = new Error(`Gemini API error (${model}): ${res.status} ${await res.text()}`);
+    } catch (fetchErr: any) {
+      lastErr = fetchErr;
     }
-    lastErr = new Error(`Gemini API error (${model}): ${res.status} ${await res.text()}`);
   }
 
   throw lastErr || new Error('Gemini API request failed');
+}
+
+function extractJsonObject(raw: string): any {
+  const trimmed = String(raw || '')
+    .replace(/```json/gi, '')
+    .replace(/```/g, '')
+    .trim();
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    const firstBrace = trimmed.indexOf('{');
+    const lastBrace = trimmed.lastIndexOf('}');
+    if (firstBrace !== -1 && lastBrace > firstBrace) {
+      return JSON.parse(trimmed.slice(firstBrace, lastBrace + 1));
+    }
+    throw new Error('No valid JSON object found in AI output');
+  }
 }
 
 function parseCleanJson(
@@ -309,8 +337,7 @@ function parseCleanJson(
   aiEngine = 'AI'
 ): ParsedSiteUpdate {
   try {
-    const cleaned = raw.replace(/^```json/im, '').replace(/^```/im, '').replace(/```$/m, '').trim();
-    const parsed = JSON.parse(cleaned);
+    const parsed = extractJsonObject(raw);
     const heuristic = fallbackHeuristicParser(fallbackText, microLib);
 
     const cleanSpaceCode = normalizeScheduleCodeInput(

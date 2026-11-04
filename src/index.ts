@@ -1387,8 +1387,8 @@ async function buildInteractivePrompt(
     : '';
   const notesLine = parsed.notes ? `• *Note:* _${parsed.notes}_\n` : '';
   const engineLabel =
-    parsed.aiEngine === 'Gemini'
-      ? '✨ Gemini'
+    parsed.aiEngine?.startsWith('Gemini')
+      ? `✨ ${parsed.aiEngine}`
       : parsed.aiEngine === 'Cloudflare AI'
         ? '☁️ Cloudflare AI'
         : '⚡ Heuristic';
