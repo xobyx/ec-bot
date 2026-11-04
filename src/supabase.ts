@@ -11,7 +11,8 @@ import type {
   TelegramAuthorizedUser,
   TelegramLinkCode,
   TelegramAuthRegistry,
-  WebSiteUser
+    WebSiteUser,
+  MicroTaskLibrary
 } from './types';
 import { normalizeScheduleCodeInput } from './ai';
 
@@ -1549,4 +1550,24 @@ export async function adminDeleteWebUser(env: Env, userId: string): Promise<void
   const { error } = await sb.auth.admin.deleteUser(userId);
   if (error) throw error;
   await unlinkTelegramUser(env, { supabaseUserId: userId });
+}
+
+export async function fetchMicroTaskLibrary(env: Env): Promise<MicroTaskLibrary> {
+  try {
+    const sb = getSupabase(env);
+    const { data, error } = await sb.from('kv').select('v').eq('k', 'microtasks').maybeSingle();
+    if (error) {
+      console.error('Error fetching microtasks from kv:', error);
+      return { library: [], codeTemplates: {} };
+    }
+    if (!data?.v) return { library: [], codeTemplates: {} };
+    const v = data.v as any;
+    return {
+      library: Array.isArray(v.library) ? v.library : [],
+      codeTemplates: (v.codeTemplates && typeof v.codeTemplates === 'object') ? v.codeTemplates : {}
+    };
+  } catch (err) {
+    console.error('fetchMicroTaskLibrary error:', err);
+    return { library: [], codeTemplates: {} };
+  }
 }

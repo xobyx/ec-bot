@@ -55,7 +55,8 @@ import {
   listRegisteredWebUsers,
   adminCreateWebUser,
   adminUpdateWebUser,
-  adminDeleteWebUser
+  adminDeleteWebUser,
+  fetchMicroTaskLibrary
 } from './supabase';
 
 const WEB_APP_BASE = 'https://ecit-tracker.pages.dev';
@@ -112,6 +113,9 @@ export default {
     // 3. Web App <-> Telegram Auth API (/api/tg-auth)
     if (url.pathname === '/api/tg-auth') {
       return handleWebTelegramAuthApi(request, env);
+    }
+    if (url.pathname === '/api/test-ai') {
+          return handleTestAiApi(request, env);
     }
 
     // 4. Webhook handler: POST / or POST /webhook
@@ -891,8 +895,8 @@ async function handleMessage(message: any, env: Env): Promise<void> {
       replyContextCode && !text.toUpperCase().includes(replyContextCode)
         ? `${replyContextCode} ${text}`.trim()
         : text;
-
-    const parsed = await analyzeSiteUpdate(env, effectiveText, photoBytes);
+    const microLib = await fetchMicroTaskLibrary(env);
+    const parsed = await analyzeSiteUpdate(env, effectiveText, photoBytes,microLib);
 
     const actionId = Math.random().toString(36).substring(2, 10);
     const pendingAction: PendingAction = {
@@ -1283,7 +1287,10 @@ async function buildInteractivePrompt(
       : '';
   const snagLine = parsed.snag
     ? `• *Snag:* ⚠️ "${parsed.snag.text}" (Trade: *${parsed.snag.trade}*)\n`
-    : '';
+      : '';
+  const microStr = parsed.microTask && parsed.finishCode
+        ? `• *Prep Step:* 🔧 "${parsed.microTask.name}" [${parsed.finishCode}] ➔ *${(parsed.status || 'updated').toUpperCase()}*\n`
+        : '';
   const notesLine = parsed.notes ? `• *Note:* _${parsed.notes}_\n` : '';
 
   let mode = action.uiMode || 'auto';
@@ -1307,7 +1314,8 @@ async function buildInteractivePrompt(
       (parsed.finishCode
         ? `• *Finish:* ${formatFinishLine(parsed.finishCode)} ${parsed.status ? `➔ *${parsed.status.toUpperCase()}*` : ''}\n`
         : '') +
-      snagLine +
+        snagLine +
+        microStr +
       photoLine +
       notesLine +
       `\n👇 *Level was not detected. Tap the floor level:*`;
@@ -1342,9 +1350,12 @@ async function buildInteractivePrompt(
       (parsed.finishCode
         ? `• *Finish:* ${formatFinishLine(parsed.finishCode)} ${parsed.status ? `➔ *${parsed.status.toUpperCase()}*` : ''}\n`
         : '') +
-      snagLine +
-      photoLine +
-      notesLine +
+        snagLine +
+        microStr +
+        photoLine +
+
+        notesLine +
+
       `\n👇 *Zone was not detected. Tap the zone:*`;
 
     const zRow: TelegramInlineKeyboardButton[] = [1, 2, 3, 4].map(z => ({
@@ -1386,7 +1397,8 @@ async function buildInteractivePrompt(
       (parsed.finishCode
         ? `• *Finish:* ${formatFinishLine(parsed.finishCode)} ${parsed.status ? `➔ *${parsed.status.toUpperCase()}*` : ''}\n`
         : '') +
-      snagLine +
+        snagLine +
+        microStr +
       photoLine +
       `\n👇 *Choose the room (${candidates.length} found, page ${page + 1}/${totalPages}):*`;
 
@@ -1469,9 +1481,12 @@ async function buildInteractivePrompt(
     `• *Room:* *${roomLabel}*\n` +
     `• *Current Finishes:*\n${checksSummary}\n` +
     `• *Finish Update:* ${finishDisplay}\n` +
-    snagLine +
-    photoLine +
-    notesLine +
+      snagLine +
+      microStr +
+      photoLine +
+
+      notesLine +
+
     `\n*Tap buttons below to adjust or confirm:*`;
 
   const keyboardRows: TelegramInlineKeyboardButton[][] = [];
@@ -1518,7 +1533,19 @@ async function buildInteractivePrompt(
       callback_data: `mode:${action.id}:pick_trade`
     });
   }
-  keyboardRows.push(snagRow);
+  const microRow: TelegramInlineKeyboardButton[] = [
+    {
+      text: parsed.microTask ? '⚠️ Micro: ON (Tap to turn OFF)' : '➕ Log as Snag',
+      callback_data: `tsnag:${action.id}:toggle`
+    }
+  ];
+  if (parsed.microTask) {
+    microRow.push({
+      text: `🛠️ Name: ${parsed.microTask.name}`,
+      callback_data: `micro:${parsed.microTask.id}:pick_trade`
+    });
+  }
+  keyboardRows.push(microRow);
 
   // Location & Stored Photos row
   const storedPhotosCount = (room.photos || []).length;
@@ -2096,5 +2123,109 @@ async function sendRoomInspectionAndPhotos(
     const publicUrl = getPhotoPublicUrl(env, p.id);
     const caption = `📸 *${title}*\n${p.code ? `Finish: ${formatFinishLine(p.code)} · ` : ''}${p.caption || 'Site photo'}\nID: \`${p.id}\``;
     await sendPhoto(token, chatId, publicUrl, caption);
+  }
+}
+async function handleTestAiApi(request: Request, env: Env): Promise<Response> {
+  // Optional security check: require Bearer token if not local dev
+  const authHeader = request.headers.get('Authorization') || '';
+  const token = authHeader.replace(/^Bearer\s+/i, '').trim();
+  if (token) {
+    const webUser = await verifySupabaseUserFromToken(env, token);
+    if (!webUser) {
+      return jsonResponse({ ok: false, error: 'Invalid auth token' }, 401);
+    }
+  }
+
+  let text = '';
+  let photoBytes: Uint8Array | undefined = undefined;
+
+  if (request.method === 'GET') {
+    const url = new URL(request.url);
+    text = url.searchParams.get('text') || url.searchParams.get('q') || '';
+    const imageUrl = url.searchParams.get('imageUrl') || '';
+    if (imageUrl) {
+      try {
+        const imgRes = await fetch(imageUrl);
+        if (imgRes.ok) {
+          photoBytes = new Uint8Array(await imgRes.arrayBuffer());
+        }
+      } catch (e: any) {
+        return jsonResponse({ ok: false, error: `Failed to fetch test image: ${e?.message}` }, 400);
+      }
+    }
+  }
+  else if (request.method === 'POST') {
+    try {
+      const body: any = await request.json();
+      text = String(body.text || body.prompt || '').trim();
+
+      // Support base64 image data (e.g., from file uploads on the frontend)
+      if (body.imageBase64) {
+        const cleanBase64 = body.imageBase64.replace(/^data:image\/\w+;base64,/, '');
+        const binaryString = atob(cleanBase64);
+        const len = binaryString.length;
+        const bytes = new Uint8Array(len);
+        for (let i = 0; i < len; i++) {
+          bytes[i] = binaryString.charCodeAt(i);
+        }
+        photoBytes = bytes;
+      } else if (body.imageUrl) {
+        const imgRes = await fetch(body.imageUrl);
+        if (imgRes.ok) {
+          photoBytes = new Uint8Array(await imgRes.arrayBuffer());
+        }
+      }
+    } catch {
+      return jsonResponse({ ok: false, error: 'Invalid JSON request body' }, 400);
+    }
+  } else {
+    return jsonResponse({ ok: false, error: 'Method not allowed' }, 405);
+  }
+
+  if (!text && !photoBytes) {
+    return jsonResponse({
+      ok: false,
+      error: 'Please supply "text", "imageUrl", or "imageBase64" in query parameters or POST body.'
+    }, 400);
+  }
+
+  try {
+    const start = performance.now();
+    const microLib = await fetchMicroTaskLibrary(env).catch(() => undefined);
+      const parsed  = await analyzeSiteUpdate(env, text, photoBytes, microLib);
+    const durationMs = Math.round(performance.now() - start);
+
+    // Optional: resolve candidate rooms against Supabase to see real matching
+    const resolvedCandidates = await resolveRoomCandidates(env, {
+      id: 'test',
+      chatId: 0,
+      telegramUserId: 0,
+      parsed,
+
+      createdAt: new Date().toISOString()
+    }).catch(() => null);
+
+    return jsonResponse({
+      ok: true,
+      durationMs,
+      input: {
+        text,
+        hasPhoto: Boolean(photoBytes),
+        photoSizeBytes: photoBytes ? photoBytes.byteLength : 0
+      },
+      parsed,
+      resolutionPreview: resolvedCandidates ? {
+        exactMatch: resolvedCandidates.exact ? formatRoomTitle(resolvedCandidates.exact) : null,
+        exactMatchId: resolvedCandidates.exact?.id || null,
+        candidateCount: resolvedCandidates.candidates.length,
+        candidateCodes: resolvedCandidates.candidates.slice(0, 5).map(r => r.spaceCode || r.space)
+      } : null
+    });
+  } catch (err: any) {
+    return jsonResponse({
+      ok: false,
+      error: err?.message || 'Error executing analyzeSiteUpdate',
+      stack: err?.stack
+    }, 500);
   }
 }

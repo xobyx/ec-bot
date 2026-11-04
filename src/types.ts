@@ -71,6 +71,16 @@ export interface TelegramInlineKeyboardMarkup {
   inline_keyboard: TelegramInlineKeyboardButton[][];
 }
 
+export interface MicroTask {
+  id: string;
+  name: string;
+}
+
+export interface MicroTaskLibrary {
+  library: MicroTask[];
+  codeTemplates: Record<string, string[]>; // finishCode -> microTaskId[]
+}
+
 export interface ParsedSiteUpdate {
   level: number | null;
   zone: number | null;
@@ -86,7 +96,14 @@ export interface ParsedSiteUpdate {
   } | null;
   notes: string;
   summary: string;
+  // Micro-task update (optional – only set when engineer mentions a specific prep step)
+  microTask?: {
+    id: string;
+    name: string;
+  } | null;
+    orginal?:any
 }
+
 
 export type BotUiMode =
   | 'auto'
