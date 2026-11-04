@@ -6,7 +6,8 @@ import type {
   TelegramInlineKeyboardMarkup,
   Room,
   Status,
-  TelegramAuthorizedUser
+  TelegramAuthorizedUser,
+  MicroTaskLibrary
 } from './types';
 import {
   sendMessage,
@@ -56,7 +57,11 @@ import {
   adminCreateWebUser,
   adminUpdateWebUser,
   adminDeleteWebUser,
-  fetchMicroTaskLibrary
+  fetchMicroTaskLibrary,
+  humanizeMicroId,
+  getRoomFinishMicroTasks,
+  quickCycleRoomMicro,
+  passAllRoomMicros
 } from './supabase';
 
 const WEB_APP_BASE = 'https://ecit-tracker.pages.dev';
@@ -843,7 +848,8 @@ async function handleMessage(message: any, env: Env): Promise<void> {
     if (isPhotosOnly) {
       await sendRoomInspectionAndPhotos(env, chatId, room, true);
     } else {
-      const card = buildRoomDashboardCard(room);
+      const microLib = await fetchMicroTaskLibrary(env);
+      const card = buildRoomDashboardCard(room, microLib);
       await sendMessage(token, chatId, card.text, { reply_markup: card.keyboard });
     }
     return;
@@ -1056,12 +1062,26 @@ async function buildBrowseRoomsListCard(
   };
 }
 
-function buildRoomDashboardCard(room: Room): { text: string; keyboard: TelegramInlineKeyboardMarkup } {
+function buildRoomDashboardCard(
+  room: Room,
+  microLib?: MicroTaskLibrary
+): { text: string; keyboard: TelegramInlineKeyboardMarkup } {
   const title = formatRoomTitle(room);
   const checkEntries = Object.entries(room.checks || {});
+  const codesWithPrep: Array<{ code: string; doneCount: number; totalCount: number }> = [];
+
   const checksLines = checkEntries.length
     ? checkEntries
-        .map(([c, st]) => `  ${statusEmoji(st)} \`${c}\` · ${finishShortDesc(c)} — *${st.toUpperCase()}*`)
+        .map(([c, st]) => {
+          const micros = getRoomFinishMicroTasks(room, c, microLib);
+          let prepTag = '';
+          if (micros.length > 0) {
+            const doneM = micros.filter(m => m.status === 'done').length;
+            prepTag = ` _(🔧 Prep: ${doneM}/${micros.length})_`;
+            codesWithPrep.push({ code: c, doneCount: doneM, totalCount: micros.length });
+          }
+          return `  ${statusEmoji(st)} \`${c}\` · ${finishShortDesc(c)} — *${st.toUpperCase()}*${prepTag}`;
+        })
         .join('\n')
     : '  _No finishes assigned_';
 
@@ -1085,7 +1105,7 @@ function buildRoomDashboardCard(room: Room): { text: string; keyboard: TelegramI
     (room.notes ? `\n📝 *Notes:* _${room.notes}_\n` : '') +
     `📸 *Stored Photos:* ${(room.photos || []).length}` +
     (logLines ? `\n\n🕒 *Recent Activity:*\n${logLines}` : '') +
-    `\n\n💡 _Tap any finish below to cycle status (Pending ➔ Ongoing ➔ Done), or reply to this message with a photo/note!_`;
+    `\n\n💡 _Tap any finish below to cycle status (Pending ➔ Ongoing ➔ Done), tap 🔧 Prep to manage micro-tasks, or reply with a photo/note!_`;
 
   const rows: TelegramInlineKeyboardButton[][] = [];
 
@@ -1097,6 +1117,17 @@ function buildRoomDashboardCard(room: Room): { text: string; keyboard: TelegramI
     }));
     for (let i = 0; i < btns.length; i += 2) {
       rows.push(btns.slice(i, i + 2));
+    }
+  }
+
+  // 1-Tap Prep Steps (Micro-tasks) buttons for finishes that have prep tasks
+  if (codesWithPrep.length > 0) {
+    const prepBtns: TelegramInlineKeyboardButton[] = codesWithPrep.slice(0, 6).map(item => ({
+      text: `🔧 ${item.code} Prep (${item.doneCount}/${item.totalCount})`,
+      callback_data: `b_prep:${room.id}:${item.code}`
+    }));
+    for (let i = 0; i < prepBtns.length; i += 2) {
+      rows.push(prepBtns.slice(i, i + 2));
     }
   }
 
@@ -1129,6 +1160,66 @@ function buildRoomDashboardCard(room: Room): { text: string; keyboard: TelegramI
   rows.push([
     { text: `⬅️ ${room.level === 0 ? 'GF' : 'L' + room.level} Z${room.zone || 'All'} Rooms`, callback_data: `b_rms:${room.level}:${room.zone || 0}:0` },
     { text: '🧭 All Levels', callback_data: 'b_lvl:all' }
+  ]);
+
+  return {
+    text,
+    keyboard: { inline_keyboard: rows }
+  };
+}
+
+function buildRoomPrepCard(
+  room: Room,
+  finishCode: string,
+  microLib: MicroTaskLibrary
+): { text: string; keyboard: TelegramInlineKeyboardMarkup } {
+  const title = formatRoomTitle(room);
+  const finishSt = room.checks?.[finishCode] || 'pending';
+  const micros = getRoomFinishMicroTasks(room, finishCode, microLib);
+  const doneCount = micros.filter(m => m.status === 'done').length;
+
+  const microLines = micros.length
+    ? micros
+        .map(m => `  ${statusEmoji(m.status)} *${m.name}* — \`${m.status.toUpperCase()}\``)
+        .join('\n')
+    : '  _No preparatory micro-tasks defined for this finish code._';
+
+  const text =
+    `🔧 *Prep Steps (Micro-Tasks)*\n` +
+    `🏠 *${title}*\n` +
+    `🎨 *Finish:* ${formatFinishLine(finishCode)} — *${finishSt.toUpperCase()}*\n` +
+    `📊 *Prep Progress:* *${doneCount} / ${micros.length} Done*\n\n` +
+    `${microLines}\n\n` +
+    `💡 _Tap any prep step below to cycle its status (Pending ➔ Ongoing ➔ Done). Completing prep steps marks the main finish Ongoing (not Done)._`;
+
+  const rows: TelegramInlineKeyboardButton[][] = [];
+
+  for (let i = 0; i < micros.length; i += 2) {
+    const pair = micros.slice(i, i + 2).map(m => ({
+      text: `${statusEmoji(m.status)} ${m.name}`.slice(0, 36),
+      callback_data: `qmic:${room.id}:${finishCode}:${m.id}`
+    }));
+    rows.push(pair);
+  }
+
+  if (micros.length > 0 && doneCount < micros.length) {
+    rows.push([
+      {
+        text: `✅ Pass All Prep (${finishCode})`,
+        callback_data: `qmicall:${room.id}:${finishCode}`
+      }
+    ]);
+  }
+
+  rows.push([
+    {
+      text: `${statusEmoji(finishSt)} Main ${finishCode}: ${finishSt.toUpperCase()} (Tap to cycle)`,
+      callback_data: `qfin:${room.id}:${finishCode}`
+    }
+  ]);
+
+  rows.push([
+    { text: '⬅️ Back to Room Card', callback_data: `b_rm:${room.id}` }
   ]);
 
   return {
@@ -1262,7 +1353,10 @@ async function buildInteractivePrompt(
   action: PendingAction
 ): Promise<{ text: string; keyboard: TelegramInlineKeyboardMarkup }> {
   const { parsed } = action;
-  const resolved = await resolveRoomCandidates(env, action);
+  const [resolved, microLib] = await Promise.all([
+    resolveRoomCandidates(env, action),
+    fetchMicroTaskLibrary(env)
+  ]);
 
   if (resolved.exact && !action.selectedRoomId) {
     action.selectedRoomId = resolved.exact.id;
@@ -1287,10 +1381,10 @@ async function buildInteractivePrompt(
       : '';
   const snagLine = parsed.snag
     ? `• *Snag:* ⚠️ "${parsed.snag.text}" (Trade: *${parsed.snag.trade}*)\n`
-      : '';
-  const microStr = parsed.microTask && parsed.finishCode
-        ? `• *Prep Step:* 🔧 "${parsed.microTask.name}" [${parsed.finishCode}] ➔ *${(parsed.status || 'updated').toUpperCase()}*\n`
-        : '';
+    : '';
+  const microStr = parsed.microTask
+    ? `• *Prep Step:* 🔧 "${parsed.microTask.name}"${parsed.finishCode ? ` [${parsed.finishCode}]` : ''} ➔ *${(parsed.status || 'done').toUpperCase()}*\n`
+    : '';
   const notesLine = parsed.notes ? `• *Note:* _${parsed.notes}_\n` : '';
 
   let mode = action.uiMode || 'auto';
@@ -1314,8 +1408,8 @@ async function buildInteractivePrompt(
       (parsed.finishCode
         ? `• *Finish:* ${formatFinishLine(parsed.finishCode)} ${parsed.status ? `➔ *${parsed.status.toUpperCase()}*` : ''}\n`
         : '') +
-        snagLine +
-        microStr +
+      snagLine +
+      microStr +
       photoLine +
       notesLine +
       `\n👇 *Level was not detected. Tap the floor level:*`;
@@ -1350,12 +1444,10 @@ async function buildInteractivePrompt(
       (parsed.finishCode
         ? `• *Finish:* ${formatFinishLine(parsed.finishCode)} ${parsed.status ? `➔ *${parsed.status.toUpperCase()}*` : ''}\n`
         : '') +
-        snagLine +
-        microStr +
-        photoLine +
-
-        notesLine +
-
+      snagLine +
+      microStr +
+      photoLine +
+      notesLine +
       `\n👇 *Zone was not detected. Tap the zone:*`;
 
     const zRow: TelegramInlineKeyboardButton[] = [1, 2, 3, 4].map(z => ({
@@ -1397,8 +1489,8 @@ async function buildInteractivePrompt(
       (parsed.finishCode
         ? `• *Finish:* ${formatFinishLine(parsed.finishCode)} ${parsed.status ? `➔ *${parsed.status.toUpperCase()}*` : ''}\n`
         : '') +
-        snagLine +
-        microStr +
+      snagLine +
+      microStr +
       photoLine +
       `\n👇 *Choose the room (${candidates.length} found, page ${page + 1}/${totalPages}):*`;
 
@@ -1457,36 +1549,125 @@ async function buildInteractivePrompt(
     };
   }
 
-  // ================= STEP 4: CONFIRMATION & FINISH/STATUS/SNAG CONTROLS =================
   const room = resolved.exact;
-  const alignedFinish = resolveFinishCodeForRoom(room, parsed.finishCode, parsed.finishKind);
+  const alignedFinish = resolveFinishCodeForRoom(
+    room,
+    parsed.finishCode,
+    parsed.finishKind,
+    parsed.microTask?.id || null,
+    microLib
+  );
   if (alignedFinish) {
     parsed.finishCode = alignedFinish;
   }
 
+  // ================= OPTIONAL: PICK PREP STEP (MICRO-TASK) =================
+  if (mode === 'pick_micro') {
+    const roomCodes = Object.keys(room.checks || {});
+    const targetCodes =
+      parsed.finishCode && parsed.finishCode !== 'ALL' && roomCodes.includes(parsed.finishCode)
+        ? [parsed.finishCode, ...roomCodes.filter(c => c !== parsed.finishCode)]
+        : roomCodes;
+
+    const options: Array<{ code: string; id: string; name: string; status: Status }> = [];
+    const seen = new Set<string>();
+
+    for (const c of targetCodes) {
+      const micros = getRoomFinishMicroTasks(room, c, microLib);
+      for (const m of micros) {
+        const key = `${c}|${m.id}`;
+        if (!seen.has(key)) {
+          seen.add(key);
+          options.push({ code: c, id: m.id, name: m.name, status: m.status });
+        }
+      }
+    }
+
+    // Fallback to global library if room's finishes have no template steps yet
+    if (options.length === 0 && microLib.library.length > 0) {
+      const defaultCode =
+        parsed.finishCode && parsed.finishCode !== 'ALL'
+          ? parsed.finishCode
+          : roomCodes[0] || '';
+      for (const m of microLib.library.slice(0, 14)) {
+        options.push({
+          code: defaultCode,
+          id: m.id,
+          name: m.name,
+          status: (defaultCode && room.steps?.[defaultCode]?.[m.id]) || 'pending'
+        });
+      }
+    }
+
+    const microRows: TelegramInlineKeyboardButton[][] = [];
+    for (let i = 0; i < Math.min(options.length, 16); i += 2) {
+      const pair = options.slice(i, i + 2).map(opt => {
+        const isSelected =
+          parsed.microTask?.id === opt.id &&
+          (!parsed.finishCode || parsed.finishCode === opt.code);
+        const prefix = isSelected ? '🎯 ' : `${statusEmoji(opt.status)} `;
+        const codeTag = opt.code ? ` [${opt.code}]` : '';
+        return {
+          text: `${prefix}${opt.name}${codeTag}`.slice(0, 42),
+          callback_data: `smicro:${action.id}:${opt.code}|${opt.id}`
+        };
+      });
+      microRows.push(pair);
+    }
+
+    if (parsed.microTask) {
+      microRows.push([
+        {
+          text: '🚫 Clear Prep Step (Update Main Finish)',
+          callback_data: `tmicro:${action.id}:clear`
+        }
+      ]);
+    }
+    microRows.push([{ text: '⬅️ Back to Confirm', callback_data: `mode:${action.id}:confirm` }]);
+
+    const text =
+      `🔧 *Select Prep Step (Micro-Task)*\n\n` +
+      `• *Room:* *${formatRoomTitle(room)}*\n` +
+      (parsed.finishCode ? `• *Finish:* ${formatFinishLine(parsed.finishCode)}\n` : '') +
+      (parsed.microTask ? `• *Selected Prep:* 🔧 *${parsed.microTask.name}*\n` : '') +
+      `\n👇 *Tap a preparatory step to update its status (or clear to update the main finish):*`;
+
+    return {
+      text,
+      keyboard: { inline_keyboard: microRows }
+    };
+  }
+
+  // ================= STEP 4: CONFIRMATION & FINISH/STATUS/SNAG CONTROLS =================
   const roomLabel = formatRoomTitle(room);
   const roomCheckEntries = Object.entries(room.checks || {});
   const checksSummary = roomCheckEntries.length
     ? roomCheckEntries
-        .map(([c, st]) => `  ${statusEmoji(st)} \`${c}\` · ${finishCompactName(c)} (*${st.toUpperCase()}*)`)
+        .map(([c, st]) => {
+          const micros = getRoomFinishMicroTasks(room, c, microLib);
+          const prepSuffix =
+            micros.length > 0
+              ? ` _(🔧 ${micros.filter(m => m.status === 'done').length}/${micros.length} prep)_`
+              : '';
+          return `  ${statusEmoji(st)} \`${c}\` · ${finishCompactName(c)} (*${st.toUpperCase()}*)${prepSuffix}`;
+        })
         .join('\n')
     : '  _No finishes linked_';
 
-  const finishDisplay = parsed.finishCode
-    ? `${formatFinishLine(parsed.finishCode)} ➔ *${(parsed.status || 'select status below').toUpperCase()}*${parsed.status === 'done' ? ' _(auto-completes micro-tasks)_' : ''}`
-    : '_Tap a finish below (optional)_';
+  const updateTargetDisplay = parsed.microTask
+    ? `🔧 *Prep "${parsed.microTask.name}"* ${parsed.finishCode ? `[${parsed.finishCode}]` : ''} ➔ *${(parsed.status || 'done').toUpperCase()}* _(sets finish to Ongoing if Pending)_`
+    : parsed.finishCode
+      ? `${formatFinishLine(parsed.finishCode)} ➔ *${(parsed.status || 'select status below').toUpperCase()}*${parsed.status === 'done' ? ' _(auto-completes micro-tasks)_' : ''}`
+      : '_Tap a finish or prep step below (optional)_';
 
   const text =
     `📋 *Confirm Room Update*\n\n` +
     `• *Room:* *${roomLabel}*\n` +
     `• *Current Finishes:*\n${checksSummary}\n` +
-    `• *Finish Update:* ${finishDisplay}\n` +
-      snagLine +
-      microStr +
-      photoLine +
-
-      notesLine +
-
+    `• *${parsed.microTask ? 'Prep Update' : 'Finish Update'}:* ${updateTargetDisplay}\n` +
+    snagLine +
+    photoLine +
+    notesLine +
     `\n*Tap buttons below to adjust or confirm:*`;
 
   const keyboardRows: TelegramInlineKeyboardButton[][] = [];
@@ -1520,6 +1701,36 @@ async function buildInteractivePrompt(
     }))
   );
 
+  // Prep Step (Micro-task) selector row
+  const microRow: TelegramInlineKeyboardButton[] = [];
+  if (parsed.microTask) {
+    microRow.push(
+      {
+        text: `🔧 Prep: ${parsed.microTask.name}`.slice(0, 32),
+        callback_data: `mode:${action.id}:pick_micro`
+      },
+      {
+        text: '❌ Clear Prep',
+        callback_data: `tmicro:${action.id}:clear`
+      }
+    );
+  } else {
+    const activeCode =
+      parsed.finishCode && parsed.finishCode !== 'ALL' ? parsed.finishCode : finishCodes[0] || '';
+    const countForCode = activeCode
+      ? getRoomFinishMicroTasks(room, activeCode, microLib).length
+      : 0;
+    if (countForCode > 0 || microLib.library.length > 0) {
+      microRow.push({
+        text: `🔧 Pick Prep Step${countForCode > 0 ? ` (${activeCode}: ${countForCode})` : ''}`,
+        callback_data: `mode:${action.id}:pick_micro`
+      });
+    }
+  }
+  if (microRow.length > 0) {
+    keyboardRows.push(microRow);
+  }
+
   // Snag toggle & Trade picker row
   const snagRow: TelegramInlineKeyboardButton[] = [
     {
@@ -1533,19 +1744,7 @@ async function buildInteractivePrompt(
       callback_data: `mode:${action.id}:pick_trade`
     });
   }
-  const microRow: TelegramInlineKeyboardButton[] = [
-    {
-      text: parsed.microTask ? '⚠️ Micro: ON (Tap to turn OFF)' : '➕ Log as Snag',
-      callback_data: `tsnag:${action.id}:toggle`
-    }
-  ];
-  if (parsed.microTask) {
-    microRow.push({
-      text: `🛠️ Name: ${parsed.microTask.name}`,
-      callback_data: `micro:${parsed.microTask.id}:pick_trade`
-    });
-  }
-  keyboardRows.push(microRow);
+  keyboardRows.push(snagRow);
 
   // Location & Stored Photos row
   const storedPhotosCount = (room.photos || []).length;
@@ -1783,10 +1982,67 @@ async function handleCallbackQuery(query: any, env: Env): Promise<void> {
   if (actionType === 'b_rm') {
     const roomId = parts.slice(1).join(':');
     await answerCallbackQuery(token, query.id);
-    const room = await getRoomByIdOrCode(env, roomId);
+    const [room, microLib] = await Promise.all([
+      getRoomByIdOrCode(env, roomId),
+      fetchMicroTaskLibrary(env)
+    ]);
     if (room && chatId && messageId) {
-      const card = buildRoomDashboardCard(room);
+      const card = buildRoomDashboardCard(room, microLib);
       await editMessageText(token, chatId, messageId, card.text, { reply_markup: card.keyboard });
+    }
+    return;
+  }
+
+  if (actionType === 'b_prep') {
+    const roomId = actionId;
+    const finishCode = value;
+    await answerCallbackQuery(token, query.id, `Prep steps for ${finishCode}`);
+    const [room, microLib] = await Promise.all([
+      getRoomByIdOrCode(env, roomId),
+      fetchMicroTaskLibrary(env)
+    ]);
+    if (room && chatId && messageId) {
+      const card = buildRoomPrepCard(room, finishCode, microLib);
+      await editMessageText(token, chatId, messageId, card.text, { reply_markup: card.keyboard });
+    }
+    return;
+  }
+
+  if (actionType === 'qmic') {
+    const roomId = actionId;
+    const [finishCode, ...microParts] = value.split(':');
+    const microId = microParts.join(':');
+    const updated = await quickCycleRoomMicro(env, roomId, finishCode, microId, authorName);
+    if (updated && chatId && messageId) {
+      await answerCallbackQuery(
+        token,
+        query.id,
+        `🔧 ${updated.microName} [${finishCode}] → ${updated.nextStatus.toUpperCase()}`
+      );
+      const microLib = await fetchMicroTaskLibrary(env);
+      const card = buildRoomPrepCard(updated.room, finishCode, microLib);
+      await editMessageText(token, chatId, messageId, card.text, { reply_markup: card.keyboard });
+    } else {
+      await answerCallbackQuery(token, query.id, 'Could not update prep step', true);
+    }
+    return;
+  }
+
+  if (actionType === 'qmicall') {
+    const roomId = actionId;
+    const finishCode = value;
+    const updated = await passAllRoomMicros(env, roomId, finishCode, authorName);
+    if (updated && chatId && messageId) {
+      await answerCallbackQuery(
+        token,
+        query.id,
+        `✅ All ${updated.count} prep steps for ${finishCode} marked DONE!`
+      );
+      const microLib = await fetchMicroTaskLibrary(env);
+      const card = buildRoomPrepCard(updated.room, finishCode, microLib);
+      await editMessageText(token, chatId, messageId, card.text, { reply_markup: card.keyboard });
+    } else {
+      await answerCallbackQuery(token, query.id, 'Could not update prep steps', true);
     }
     return;
   }
@@ -1794,14 +2050,17 @@ async function handleCallbackQuery(query: any, env: Env): Promise<void> {
   if (actionType === 'qfin') {
     const roomId = actionId;
     const finishCode = value;
-    const updated = await quickCycleRoomFinish(env, roomId, finishCode, authorName);
+    const [updated, microLib] = await Promise.all([
+      quickCycleRoomFinish(env, roomId, finishCode, authorName),
+      fetchMicroTaskLibrary(env)
+    ]);
     if (updated && chatId && messageId) {
       await answerCallbackQuery(
         token,
         query.id,
         `${finishCode} (${finishCompactName(finishCode)}) → ${updated.nextStatus.toUpperCase()}`
       );
-      const card = buildRoomDashboardCard(updated.room);
+      const card = buildRoomDashboardCard(updated.room, microLib);
       await editMessageText(token, chatId, messageId, card.text, { reply_markup: card.keyboard });
     } else {
       await answerCallbackQuery(token, query.id, 'Could not update finish', true);
@@ -1812,10 +2071,13 @@ async function handleCallbackQuery(query: any, env: Env): Promise<void> {
   if (actionType === 'qsnag') {
     const roomId = actionId;
     const snagId = value;
-    const res = await closeRoomSnag(env, roomId, snagId, authorName);
+    const [res, microLib] = await Promise.all([
+      closeRoomSnag(env, roomId, snagId, authorName),
+      fetchMicroTaskLibrary(env)
+    ]);
     if (res && chatId && messageId) {
       await answerCallbackQuery(token, query.id, 'Snag marked as Resolved ✅');
-      const card = buildRoomDashboardCard(res.room);
+      const card = buildRoomDashboardCard(res.room, microLib);
       await editMessageText(token, chatId, messageId, card.text, { reply_markup: card.keyboard });
     } else {
       await answerCallbackQuery(token, query.id, 'Could not resolve snag', true);
@@ -1950,11 +2212,55 @@ async function handleCallbackQuery(query: any, env: Env): Promise<void> {
 
   if (actionType === 'sfin') {
     pending.parsed.finishCode = value;
+    if (value === 'ALL') {
+      pending.parsed.microTask = null;
+    } else if (pending.parsed.microTask) {
+      const microLib = await fetchMicroTaskLibrary(env);
+      const tmpl = microLib.codeTemplates?.[value] || [];
+      if (tmpl.length > 0 && !tmpl.includes(pending.parsed.microTask.id)) {
+        pending.parsed.microTask = null;
+      }
+    }
     if (!pending.parsed.status) {
       pending.parsed.status = 'done';
     }
     pending.uiMode = 'confirm';
     await answerCallbackQuery(token, query.id, `${value} · ${finishCompactName(value)}`);
+    await updateCardMessage(env, chatId, messageId, pending);
+    return;
+  }
+
+  if (actionType === 'tmicro') {
+    pending.parsed.microTask = null;
+    pending.uiMode = 'confirm';
+    await answerCallbackQuery(token, query.id, 'Prep step cleared (updating main finish)');
+    await updateCardMessage(env, chatId, messageId, pending);
+    return;
+  }
+
+  if (actionType === 'smicro') {
+    const microLib = await fetchMicroTaskLibrary(env);
+    const sepIdx = value.indexOf('|');
+    const codePart = sepIdx >= 0 ? value.slice(0, sepIdx) : '';
+    const microId = sepIdx >= 0 ? value.slice(sepIdx + 1) : value;
+    if (!microId || microId === 'none') {
+      pending.parsed.microTask = null;
+    } else {
+      const name = humanizeMicroId(microId, microLib);
+      pending.parsed.microTask = { id: microId, name };
+      if (codePart) {
+        pending.parsed.finishCode = codePart;
+      }
+      if (!pending.parsed.status) {
+        pending.parsed.status = 'done';
+      }
+    }
+    pending.uiMode = 'confirm';
+    await answerCallbackQuery(
+      token,
+      query.id,
+      pending.parsed.microTask ? `🔧 Prep: ${pending.parsed.microTask.name}` : 'Main finish mode'
+    );
     await updateCardMessage(env, chatId, messageId, pending);
     return;
   }
@@ -2029,8 +2335,12 @@ async function handleCallbackQuery(query: any, env: Env): Promise<void> {
       const result = await applyUpdateToRoom(env, pending, photoId);
       await deletePendingAction(env, actionId).catch(() => {});
 
-      const finishLine =
-        result.appliedFinish && pending.parsed.status
+      const finishOrMicroLine = result.appliedMicro
+        ? `• *Prep Step:* 🔧 *${result.appliedMicro.name}*${result.appliedFinish ? ` [${result.appliedFinish}]` : ''} ➔ *${result.appliedMicro.status.toUpperCase()}*\n` +
+          (result.appliedFinish
+            ? `• *Main Finish:* ${formatFinishLine(result.appliedFinish)} — *${(result.room.checks?.[result.appliedFinish] || 'ongoing').toUpperCase()}*\n`
+            : '')
+        : result.appliedFinish && pending.parsed.status
           ? `• *Finish:* ${formatFinishLine(result.appliedFinish)} ➔ *${pending.parsed.status.toUpperCase()}*\n`
           : '';
       const snagLine = pending.parsed.snag
@@ -2041,7 +2351,7 @@ async function handleCallbackQuery(query: any, env: Env): Promise<void> {
       const successText =
         `✅ *Saved to ECIT Site Tracker!*\n\n` +
         `• *Room:* *${result.roomTitle}*\n` +
-        finishLine +
+        finishOrMicroLine +
         snagLine +
         photoLine +
         `\n_Live synced with Supabase & ECIT Web App._`;
@@ -2049,6 +2359,9 @@ async function handleCallbackQuery(query: any, env: Env): Promise<void> {
       const postButtons: TelegramInlineKeyboardButton[][] = [
         [
           { text: '🏠 Open Room Card', callback_data: `b_rm:${result.room.id}` },
+          ...(result.appliedMicro && result.appliedFinish
+            ? [{ text: `🔧 ${result.appliedFinish} Prep Steps`, callback_data: `b_prep:${result.room.id}:${result.appliedFinish}` }]
+            : []),
           { text: '↩️ Undo Change', callback_data: `undo:${result.undoId}` }
         ]
       ];
@@ -2109,7 +2422,8 @@ async function sendRoomInspectionAndPhotos(
   const title = formatRoomTitle(room);
 
   if (!photosOnly) {
-    const card = buildRoomDashboardCard(room);
+    const microLib = await fetchMicroTaskLibrary(env);
+    const card = buildRoomDashboardCard(room, microLib);
     await sendMessage(token, chatId, card.text, { reply_markup: card.keyboard });
   }
 

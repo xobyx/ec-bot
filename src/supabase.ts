@@ -545,24 +545,79 @@ export async function resolveRoomCandidates(
   return { exact: null, candidates: levelRooms };
 }
 
+export function humanizeMicroId(id: string, microLib?: MicroTaskLibrary): string {
+  if (!id) return '';
+  const found = microLib?.library?.find(m => m.id === id);
+  if (found?.name) return found.name;
+  const match = /^m_(.+)_[a-z0-9]{3,5}$/i.exec(id);
+  if (match?.[1]) {
+    return match[1]
+      .split('_')
+      .map(w => (w ? w[0].toUpperCase() + w.slice(1) : ''))
+      .join(' ');
+  }
+  return id;
+}
+
+export function getRoomFinishMicroTasks(
+  room: Room,
+  finishCode: string,
+  microLib?: MicroTaskLibrary
+): Array<{ id: string; name: string; status: Status }> {
+  const tmplIds = microLib?.codeTemplates?.[finishCode] || [];
+  const stepMap = room.steps?.[finishCode] || {};
+  const existingIds = Object.keys(stepMap);
+  const allIds = [...new Set([...tmplIds, ...existingIds])];
+  const defaultStatus: Status = room.checks?.[finishCode] === 'done' ? 'done' : 'pending';
+
+  return allIds.map(id => ({
+    id,
+    name: humanizeMicroId(id, microLib),
+    status: stepMap[id] || defaultStatus
+  }));
+}
+
 async function getMicroTemplates(env: Env): Promise<Record<string, string[]>> {
-  try {
-    const sb = getSupabase(env);
-    const { data } = await sb.from('kv').select('v').eq('k', 'microtasks').maybeSingle();
-    if (data?.v?.codeTemplates && typeof data.v.codeTemplates === 'object') {
-      return data.v.codeTemplates as Record<string, string[]>;
-    }
-  } catch {}
-  return {};
+  const lib = await fetchMicroTaskLibrary(env);
+  return lib.codeTemplates || {};
 }
 
 export function resolveFinishCodeForRoom(
   room: Room,
   finishCode: string | null,
-  finishKind: string | null
+  finishKind: string | null,
+  microTaskId?: string | null,
+  microLib?: MicroTaskLibrary
 ): string | null {
   const roomCodes = Object.keys(room.checks || {});
   if (!roomCodes.length) return finishCode;
+
+  if (finishCode === 'ALL' && !microTaskId) return 'ALL';
+
+  // If a micro-task is specified, prioritize a finish code in this room that owns this micro-task
+  if (microTaskId) {
+    if (finishCode && roomCodes.includes(finishCode)) {
+      const hasInRoomOrTmpl =
+        Boolean(room.steps?.[finishCode]?.[microTaskId]) ||
+        Boolean(microLib?.codeTemplates?.[finishCode]?.includes(microTaskId));
+      if (hasInRoomOrTmpl) return finishCode;
+    }
+
+    const matchingRoomCodes = roomCodes.filter(
+      c =>
+        Boolean(room.steps?.[c]?.[microTaskId]) ||
+        Boolean(microLib?.codeTemplates?.[c]?.includes(microTaskId))
+    );
+    if (matchingRoomCodes.length === 1) {
+      return matchingRoomCodes[0];
+    }
+    if (matchingRoomCodes.length > 1 && finishCode && matchingRoomCodes.includes(finishCode)) {
+      return finishCode;
+    }
+    if (matchingRoomCodes.length > 0 && (!finishCode || !roomCodes.includes(finishCode))) {
+      return matchingRoomCodes[0];
+    }
+  }
 
   if (finishCode === 'ALL') return 'ALL';
 
@@ -594,14 +649,20 @@ export function resolveFinishCodeForRoom(
     }
   }
 
-  return finishCode;
+  return finishCode || roomCodes[0] || null;
 }
 
 export async function applyUpdateToRoom(
   env: Env,
   action: PendingAction,
   photoId?: string
-): Promise<{ room: Room; roomTitle: string; appliedFinish?: string; undoId: string }> {
+): Promise<{
+  room: Room;
+  roomTitle: string;
+  appliedFinish?: string;
+  appliedMicro?: { id: string; name: string; status: Status };
+  undoId: string;
+}> {
   const sb = getSupabase(env);
   const { parsed, telegramUsername } = action;
 
@@ -636,8 +697,15 @@ export async function applyUpdateToRoom(
     updated: nowIso
   };
 
-  const targetFinish = resolveFinishCodeForRoom(roomObj, parsed.finishCode, parsed.finishKind);
-  const codeTemplates = parsed.status === 'done' ? await getMicroTemplates(env) : {};
+  const microLib = await fetchMicroTaskLibrary(env);
+  const codeTemplates = microLib.codeTemplates || {};
+  const targetFinish = resolveFinishCodeForRoom(
+    roomObj,
+    parsed.finishCode,
+    parsed.finishKind,
+    parsed.microTask?.id || null,
+    microLib
+  );
 
   const completeMicrosForCode = (code: string) => {
     const tmpl = codeTemplates[code] || [];
@@ -651,7 +719,45 @@ export async function applyUpdateToRoom(
     }
   };
 
-  if (targetFinish && parsed.status) {
+  let appliedMicro: { id: string; name: string; status: Status } | undefined = undefined;
+
+  if (parsed.microTask && parsed.microTask.id) {
+    const stepStatus: Status = parsed.status || 'done';
+    const microId = parsed.microTask.id;
+    const microName = parsed.microTask.name || humanizeMicroId(microId, microLib);
+    const targetCodes =
+      targetFinish && targetFinish !== 'ALL'
+        ? [targetFinish]
+        : Object.keys(roomObj.checks).filter(
+            c =>
+              Boolean(roomObj.steps?.[c]?.[microId]) ||
+              Boolean(codeTemplates[c]?.includes(microId))
+          );
+    const effectiveCodes =
+      targetCodes.length > 0 ? targetCodes : Object.keys(roomObj.checks).slice(0, 1);
+
+    for (const c of effectiveCodes) {
+      if (!roomObj.steps[c]) roomObj.steps[c] = {};
+      // Initialize any template micro-tasks for this finish code if not yet present
+      for (const tmplMid of codeTemplates[c] || []) {
+        if (!roomObj.steps[c][tmplMid]) {
+          roomObj.steps[c][tmplMid] = roomObj.checks[c] === 'done' ? 'done' : 'pending';
+        }
+      }
+      roomObj.steps[c][microId] = stepStatus;
+
+      // Completing or starting a prep step sets unknown/pending finish to 'ongoing' (never auto-'done')
+      const curCheck = roomObj.checks[c];
+      if (
+        (!curCheck || curCheck === 'unknown' || curCheck === 'pending') &&
+        (stepStatus === 'ongoing' || stepStatus === 'done')
+      ) {
+        roomObj.checks[c] = 'ongoing';
+      }
+    }
+
+    appliedMicro = { id: microId, name: microName, status: stepStatus };
+  } else if (targetFinish && parsed.status) {
     if (targetFinish === 'ALL') {
       Object.keys(roomObj.checks).forEach(c => {
         roomObj.checks[c] = parsed.status as Status;
@@ -685,7 +791,9 @@ export async function applyUpdateToRoom(
 
   const photoCaption = parsed.snag
     ? `Snag: ${parsed.snag.text}`
-    : parsed.notes || parsed.summary || 'Telegram site update';
+    : appliedMicro
+      ? `Prep "${appliedMicro.name}" (${targetFinish || ''}) → ${appliedMicro.status.toUpperCase()}`
+      : parsed.notes || parsed.summary || 'Telegram site update';
   const photoCode = targetFinish && targetFinish !== 'ALL' ? targetFinish : '';
 
   if (photoId) {
@@ -715,8 +823,11 @@ export async function applyUpdateToRoom(
   }
 
   const summaryParts: string[] = [];
-  if (targetFinish && parsed.status) {
-    summaryParts.push(`${ targetFinish } (${finishCompactName(targetFinish)}) → ${parsed.status.toUpperCase()}`);
+  if (appliedMicro) {
+    const codeLabel = targetFinish ? ` for ${targetFinish} (${finishCompactName(targetFinish)})` : '';
+    summaryParts.push(`Prep "${appliedMicro.name}"${codeLabel} → ${appliedMicro.status.toUpperCase()}`);
+  } else if (targetFinish && parsed.status) {
+    summaryParts.push(`${targetFinish} (${finishCompactName(targetFinish)}) → ${parsed.status.toUpperCase()}`);
   }
   if (parsed.snag) {
     summaryParts.push(`Snag logged: "${parsed.snag.text}" (${parsed.snag.trade || 'General'})`);
@@ -760,6 +871,7 @@ export async function applyUpdateToRoom(
     room: roomObj,
     roomTitle: formatRoomTitle(roomObj),
     appliedFinish: targetFinish || undefined,
+    appliedMicro,
     undoId
   };
 }
@@ -823,6 +935,140 @@ export async function quickCycleRoomFinish(
 
   if (error) throw error;
   return { room, nextStatus };
+}
+
+/**
+ * Cycles a single micro-task prep step on a room from the Interactive Room Browser.
+ */
+export async function quickCycleRoomMicro(
+  env: Env,
+  roomId: string,
+  finishCode: string,
+  microId: string,
+  authorName?: string
+): Promise<{ room: Room; microName: string; nextStatus: Status } | null> {
+  const room = await getRoomByIdOrCode(env, roomId);
+  if (!room) return null;
+
+  const sb = getSupabase(env);
+  const microLib = await fetchMicroTaskLibrary(env);
+  if (!room.steps) room.steps = {};
+  if (!room.steps[finishCode]) room.steps[finishCode] = {};
+
+  // Ensure template steps for this finish code are initialized
+  const tmpl = microLib.codeTemplates?.[finishCode] || [];
+  for (const tid of tmpl) {
+    if (!room.steps[finishCode][tid]) {
+      room.steps[finishCode][tid] = room.checks?.[finishCode] === 'done' ? 'done' : 'pending';
+    }
+  }
+
+  const current: Status =
+    room.steps[finishCode][microId] ||
+    (room.checks?.[finishCode] === 'done' ? 'done' : 'pending');
+  const order: Status[] = ['pending', 'ongoing', 'done'];
+  const idx = order.indexOf(current);
+  const nextStatus: Status = order[(idx + 1) % order.length];
+
+  room.steps[finishCode][microId] = nextStatus;
+
+  // Web App rule: active prep work sets unknown/pending finish to 'ongoing'
+  if (!room.checks) room.checks = {};
+  const curCheck = room.checks[finishCode];
+  if (
+    (!curCheck || curCheck === 'unknown' || curCheck === 'pending') &&
+    (nextStatus === 'ongoing' || nextStatus === 'done')
+  ) {
+    room.checks[finishCode] = 'ongoing';
+  }
+
+  const microName = humanizeMicroId(microId, microLib);
+  const nowIso = new Date().toISOString();
+  const uid = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+  room.log = [
+    {
+      id: 'l' + uid,
+      ts: nowIso,
+      text: `[Telegram] Prep "${microName}" for ${finishCode} (${finishCompactName(finishCode)}) → ${nextStatus.toUpperCase()}`,
+      by: formatAuthorTag(authorName)
+    },
+    ...(room.log || [])
+  ];
+
+  const { error } = await sb
+    .from('rooms')
+    .update({
+      notes: room.notes || '',
+      checks: room.checks,
+      steps: room.steps,
+      log: room.log,
+      snags: room.snags || [],
+      photos: room.photos || []
+    })
+    .eq('id', room.id);
+
+  if (error) throw error;
+  return { room, microName, nextStatus };
+}
+
+/**
+ * Marks all preparatory micro-tasks for a finish code in a room as 'done' (and sets finish to 'ongoing' if pending).
+ */
+export async function passAllRoomMicros(
+  env: Env,
+  roomId: string,
+  finishCode: string,
+  authorName?: string
+): Promise<{ room: Room; count: number } | null> {
+  const room = await getRoomByIdOrCode(env, roomId);
+  if (!room) return null;
+
+  const sb = getSupabase(env);
+  const microLib = await fetchMicroTaskLibrary(env);
+  if (!room.steps) room.steps = {};
+  if (!room.steps[finishCode]) room.steps[finishCode] = {};
+
+  const tmpl = microLib.codeTemplates?.[finishCode] || [];
+  const existing = Object.keys(room.steps[finishCode]);
+  const allMids = [...new Set([...tmpl, ...existing])];
+  if (allMids.length === 0) return { room, count: 0 };
+
+  for (const mid of allMids) {
+    room.steps[finishCode][mid] = 'done';
+  }
+
+  if (!room.checks) room.checks = {};
+  const curCheck = room.checks[finishCode];
+  if (!curCheck || curCheck === 'unknown' || curCheck === 'pending') {
+    room.checks[finishCode] = 'ongoing';
+  }
+
+  const nowIso = new Date().toISOString();
+  const uid = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+  room.log = [
+    {
+      id: 'l' + uid,
+      ts: nowIso,
+      text: `[Telegram] All prep (${allMids.length} steps) for ${finishCode} (${finishCompactName(finishCode)}) marked DONE`,
+      by: formatAuthorTag(authorName)
+    },
+    ...(room.log || [])
+  ];
+
+  const { error } = await sb
+    .from('rooms')
+    .update({
+      notes: room.notes || '',
+      checks: room.checks,
+      steps: room.steps,
+      log: room.log,
+      snags: room.snags || [],
+      photos: room.photos || []
+    })
+    .eq('id', room.id);
+
+  if (error) throw error;
+  return { room, count: allMids.length };
 }
 
 /**

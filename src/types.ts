@@ -112,7 +112,8 @@ export type BotUiMode =
   | 'pick_zone'
   | 'pick_room'
   | 'pick_finish'
-  | 'pick_trade';
+  | 'pick_trade'
+  | 'pick_micro';
 
 export interface RoomUndoSnapshot {
   roomId: string;

@@ -1,6 +1,35 @@
-import type { Env, ParsedSiteUpdate } from './types';
+import type { Env, ParsedSiteUpdate,MicroTaskLibrary } from './types';
 
-const SYSTEM_PROMPT = `You are an expert AI site engineer assistant for the ECIT Building Construction Site Tracker.
+function buildMicroTaskPromptSection(lib: MicroTaskLibrary): string {
+  if (!lib.library.length) return '';
+
+  const lines: string[] = [
+    '',
+    '- Micro-task Prep Steps (preparatory tasks tracked under each finish code):',
+    '  These are sub-steps engineers complete before a finish item is done.',
+    '  If the engineer mentions a prep step by name, extract it as a "microTask".',
+    '  Known micro-tasks (name → id):'
+  ];
+
+  lib.library.forEach(m => {
+    lines.push(`    * "${m.name}" → id: "${m.id}"`);
+  });
+
+  if (Object.keys(lib.codeTemplates).length) {
+    lines.push('  Default micro-tasks per finish code (use this to infer which finishCode the prep step belongs to):');
+    for (const [code, ids] of Object.entries(lib.codeTemplates)) {
+      const names = ids
+        .map(id => lib.library.find(m => m.id === id)?.name || id)
+        .join(', ');
+      lines.push(`    * ${code}: ${names}`);
+    }
+  }
+
+  return lines.join('\n');
+}
+function buildSystemPrompt(microLib?: MicroTaskLibrary): string {
+    const microSection = microLib ? buildMicroTaskPromptSection(microLib) : '';
+    return `You are an expert AI site engineer assistant for the ECIT Building Construction Site Tracker.
 Your job is to analyze site messages and photos submitted by site engineers via Telegram, and extract structured progress updates, finishes, and snags (defects).
 
 Project details:
@@ -39,12 +68,16 @@ Project details:
 
 - Status values must be strictly: "pending", "ongoing", "done", or null if not mentioned.
 - Snag trades: "Paint", "Plaster", "Tile", "Floor", "Ceiling", "MEP", "Civil", "Joinery", "Glazing", "General".
-
+${microSection}
 CRITICAL EXTRACTION RULES:
 1. "level": Extract level number (0..8) ONLY if mentioned or inferred from room code (e.g. GF-008 -> 0, F4-041 -> 4). Otherwise null!
 2. "zone": Extract zone number (1..4, or 0 if "all zones") ONLY if mentioned. Otherwise null!
 3. "space": Put the uppercase Space Name here (e.g. "GARBAGE ROOM", "POD TOILET", "CORRIDOR", "MEP SHAFT"). If not mentioned, null!
 4. "spaceCode" / "spaceNo": Put explicit room code (e.g. "GF-008", "F1-040C", "F4-041", "204") ONLY if explicitly written. Never invent a room number!
+5. "microTask": If the engineer mentions a prep step by name (e.g. "water proofing done", "layout drawing ongoing", "suspension started"),
+   fill microTask with the matching { "id": "...", "name": "..." } from the known micro-tasks list above.
+   Also set "finishCode" to the finish code this prep step belongs to (use the "Default micro-tasks per finish code" table as a guide).
+   If the message is about a WHOLE finish item (not a specific prep step), set microTask to null.
 
 You MUST return ONLY a valid JSON object with the following schema:
 {
@@ -60,11 +93,12 @@ You MUST return ONLY a valid JSON object with the following schema:
     "text": string,
     "trade": string
   } or null,
+  "microTask": { "id": string, "name": string } or null,
   "notes": string,
   "summary": string
 }
 No markdown fences, no explanation, only the JSON.`;
-
+}
 export function normalizeScheduleCodeInput(raw: string | null | undefined): string | null {
   if (!raw) return null;
   const s = String(raw).trim().toUpperCase();
@@ -76,26 +110,113 @@ export function normalizeScheduleCodeInput(raw: string | null | undefined): stri
   return s;
 }
 
+export function resolveMicroTaskFromLibrary(
+  text: string,
+  rawMicro: any,
+  currentFinishCode: string | null,
+  microLib?: MicroTaskLibrary
+): {
+  microTask: { id: string; name: string } | null;
+  inferredFinishCode: string | null;
+} {
+  const lib = microLib?.library || [];
+  const templates = microLib?.codeTemplates || {};
+  const norm = (s: string) =>
+    String(s || '')
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '');
+
+  let matched: { id: string; name: string } | null = null;
+
+  // 1. Check AI-provided microTask first
+  if (rawMicro) {
+    const rawId = typeof rawMicro === 'object' ? String(rawMicro.id || '').trim() : '';
+    const rawName =
+      typeof rawMicro === 'string'
+        ? rawMicro.trim()
+        : typeof rawMicro === 'object'
+          ? String(rawMicro.name || '').trim()
+          : '';
+
+    if (lib.length > 0) {
+      const byExactId = rawId ? lib.find(m => m.id === rawId) : undefined;
+      const byExactName = rawName
+        ? lib.find(m => m.name.toLowerCase() === rawName.toLowerCase())
+        : undefined;
+      const byNormName = rawName
+        ? lib.find(
+            m =>
+              norm(m.name) === norm(rawName) ||
+              norm(m.name).includes(norm(rawName)) ||
+              norm(rawName).includes(norm(m.name))
+          )
+        : undefined;
+      const found = byExactId || byExactName || byNormName;
+      if (found) {
+        matched = { id: found.id, name: found.name };
+      }
+    }
+
+    if (!matched && rawId && rawName) {
+      matched = { id: rawId, name: rawName };
+    }
+  }
+
+  // 2. Fallback: scan user text for known micro-tasks in library
+  if (!matched && text && lib.length > 0) {
+    const lowerText = text.toLowerCase();
+    const normText = norm(text);
+    const sortedLib = [...lib].sort((a, b) => b.name.length - a.name.length);
+    for (const item of sortedLib) {
+      const itemLower = item.name.toLowerCase().trim();
+      const itemNorm = norm(item.name);
+      if (itemLower.length >= 3 && (lowerText.includes(itemLower) || (itemNorm.length >= 5 && normText.includes(itemNorm)))) {
+        matched = { id: item.id, name: item.name };
+        break;
+      }
+    }
+  }
+
+  // 3. Infer finishCode from codeTemplates if needed
+  let inferredFinishCode = currentFinishCode;
+  if (matched) {
+    const matchingCodes = Object.entries(templates)
+      .filter(([, ids]) => Array.isArray(ids) && ids.includes(matched!.id))
+      .map(([code]) => code.toUpperCase());
+
+    if (matchingCodes.length > 0) {
+      if (!inferredFinishCode || !matchingCodes.includes(inferredFinishCode.toUpperCase())) {
+        inferredFinishCode = matchingCodes[0];
+      }
+    }
+  }
+
+  return { microTask: matched, inferredFinishCode };
+}
+
 export async function analyzeSiteUpdate(
   env: Env,
   text: string,
-  imageBytes?: Uint8Array
+  imageBytes?: Uint8Array,
+  microLib?: MicroTaskLibrary
 ): Promise<ParsedSiteUpdate> {
+  const SYSTEM_PROMPT = buildSystemPrompt(microLib);
   if (env.GEMINI_API_KEY) {
     try {
-      return await analyzeWithGemini(env.GEMINI_API_KEY, text, imageBytes);
+      return await analyzeWithGemini(env.GEMINI_API_KEY, SYSTEM_PROMPT, text, imageBytes, microLib);
     } catch (err) {
       console.error('Gemini analysis failed, falling back to Workers AI:', err);
     }
   }
-
-  return await analyzeWithWorkersAI(env.AI, text, imageBytes);
+  return await analyzeWithWorkersAI(env.AI, SYSTEM_PROMPT, text, imageBytes, microLib);
 }
 
 async function analyzeWithWorkersAI(
   ai: any,
+  SYSTEM_PROMPT: string,
   text: string,
-  imageBytes?: Uint8Array
+  imageBytes?: Uint8Array,
+  microLib?: MicroTaskLibrary
 ): Promise<ParsedSiteUpdate> {
   const promptText = `User message: "${text || 'Please inspect attached site photo'}"`;
 
@@ -119,20 +240,20 @@ async function analyzeWithWorkersAI(
     }
 
     const responseText = result?.response || (typeof result === 'string' ? result : JSON.stringify(result));
-    return parseCleanJson(responseText, text);
+    return parseCleanJson(responseText, text, undefined, microLib);
   } catch (err: any) {
     console.error('Workers AI execution error:', err);
-    return fallbackHeuristicParser(text);
+    return fallbackHeuristicParser(text, microLib);
   }
 }
 
 async function analyzeWithGemini(
   apiKey: string,
+  SYSTEM_PROMPT: string,
   text: string,
-  imageBytes?: Uint8Array
+  imageBytes?: Uint8Array,
+  microLib?: MicroTaskLibrary
 ): Promise<ParsedSiteUpdate> {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`;
-
   const parts: any[] = [];
   parts.push({ text: `${SYSTEM_PROMPT}\n\nAnalyze this site update: "${text || 'Please inspect photo'}"` });
 
@@ -152,32 +273,44 @@ async function analyzeWithGemini(
     });
   }
 
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      contents: [{ parts }],
-      generationConfig: {
-        temperature: 0.1,
-        response_mime_type: 'application/json'
-      }
-    })
-  });
+  const models = ['gemini-2.0-flash', 'gemini-3.1-flash-lite', 'gemini-1.5-flash'];
+  let lastErr: any = null;
 
-  if (!res.ok) {
-    throw new Error(`Gemini API error: ${res.status} ${await res.text()}`);
+  for (const model of models) {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{ parts }],
+        generationConfig: {
+          temperature: 0.1,
+          response_mime_type: 'application/json'
+        }
+      })
+    });
+
+    if (res.ok) {
+      const data: any = await res.json();
+      const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
+      return parseCleanJson(rawText, text, data, microLib);
+    }
+    lastErr = new Error(`Gemini API error (${model}): ${res.status} ${await res.text()}`);
   }
 
-  const data: any = await res.json();
-  const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
-  return parseCleanJson(rawText, text);
+  throw lastErr || new Error('Gemini API request failed');
 }
 
-function parseCleanJson(raw: string, fallbackText: string): ParsedSiteUpdate {
+function parseCleanJson(
+  raw: string,
+  fallbackText: string,
+  org?: any,
+  microLib?: MicroTaskLibrary
+): ParsedSiteUpdate {
   try {
     const cleaned = raw.replace(/^```json/im, '').replace(/^```/im, '').replace(/```$/m, '').trim();
     const parsed = JSON.parse(cleaned);
-    const heuristic = fallbackHeuristicParser(fallbackText);
+    const heuristic = fallbackHeuristicParser(fallbackText, microLib);
 
     const cleanSpaceCode = normalizeScheduleCodeInput(
       parsed.spaceCode || parsed.spaceNo || heuristic.spaceCode || ''
@@ -195,10 +328,18 @@ function parseCleanJson(raw: string, fallbackText: string): ParsedSiteUpdate {
     }
 
     const space = (parsed.space && parsed.space !== 'SITE' ? String(parsed.space).toUpperCase() : null) || heuristic.space;
-    const finishCode = (parsed.finishCode ? String(parsed.finishCode).toUpperCase() : null) || heuristic.finishCode;
+    const rawFinishCode = (parsed.finishCode ? String(parsed.finishCode).toUpperCase() : null) || heuristic.finishCode;
     const status = ['pending', 'ongoing', 'done'].includes(parsed.status)
       ? parsed.status
       : heuristic.status;
+
+    const { microTask, inferredFinishCode } = resolveMicroTaskFromLibrary(
+      fallbackText,
+      parsed.microTask || heuristic.microTask,
+      rawFinishCode,
+      microLib
+    );
+    const finishCode = inferredFinishCode || rawFinishCode;
 
     return {
       level,
@@ -217,11 +358,13 @@ function parseCleanJson(raw: string, fallbackText: string): ParsedSiteUpdate {
             }
           : heuristic.snag,
       notes: parsed.notes || fallbackText,
-      summary: parsed.summary || heuristic.summary || 'Site update parsed'
+      summary: parsed.summary || heuristic.summary || 'Site update parsed',
+      microTask,
+      orginal: org
     };
   } catch (e) {
     console.error('Failed to parse AI JSON:', raw, e);
-    return fallbackHeuristicParser(fallbackText);
+    return fallbackHeuristicParser(fallbackText, microLib);
   }
 }
 
@@ -233,7 +376,10 @@ const KNOWN_SPACES = [
   'IDF RM', 'SERVER ROOM', 'KITCHEN', 'PANTRY', 'MEP SHAFT', 'MEP', 'P.SHAFT', 'SHAFT', 'F.H.R.'
 ];
 
-export function fallbackHeuristicParser(text: string): ParsedSiteUpdate {
+export function fallbackHeuristicParser(
+  text: string,
+  microLib?: MicroTaskLibrary
+): ParsedSiteUpdate {
   const upper = (text || '').toUpperCase();
 
   // 1. Match explicit Room Code like GF-008, GF008, F1-021, F1-040C, F4-041
@@ -358,7 +504,25 @@ export function fallbackHeuristicParser(text: string): ParsedSiteUpdate {
     };
   }
 
+  // 9. Match micro-task prep step if present in microLib
+  const { microTask, inferredFinishCode } = resolveMicroTaskFromLibrary(
+    text,
+    null,
+    finishCode,
+    microLib
+  );
+  if (inferredFinishCode) {
+    finishCode = inferredFinishCode;
+    const p = finishCode.charAt(0).toUpperCase();
+    finishKind = p === 'F' ? 'Floor' : p === 'W' ? 'Wall' : p === 'C' ? 'Ceiling' : 'Skirting';
+  }
+
   const spaceTitle = spaceCode ? `${space || 'Room'} (${spaceCode})` : space || 'Room';
+  const targetDesc = microTask
+    ? ` Prep "${microTask.name}"${finishCode ? ` [${finishCode}]` : ''}`
+    : finishCode
+      ? ` ${finishCode}`
+      : '';
 
   return {
     level,
@@ -370,7 +534,8 @@ export function fallbackHeuristicParser(text: string): ParsedSiteUpdate {
     finishKind,
     status,
     snag,
+    microTask,
     notes: text,
-    summary: `${spaceTitle}${finishCode ? ` ${finishCode}` : ''}${status ? ` → ${status.toUpperCase()}` : ''}`
+    summary: `${spaceTitle}${targetDesc}${status ? ` → ${status.toUpperCase()}` : ''}`
   };
 }
