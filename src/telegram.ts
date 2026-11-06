@@ -173,6 +173,7 @@ export async function setMyCommands(botToken: string): Promise<any> {
     { command: 'snags', description: '⚠️ View & resolve open snags across site' },
     { command: 'room', description: '🚪 Inspect a room by code (e.g. /room F1-021)' },
     { command: 'photos', description: '🖼️ View stored photos for a room' },
+    { command: 'notify', description: '🔔 Toggle live site change notifications ON/OFF' },
     { command: 'auth', description: '🔐 Authenticate with Link Code or Invite Code' },
     { command: 'login', description: '🔑 Sign in with Web App email & password' },
     { command: 'whoami', description: '👤 View linked account & role' },

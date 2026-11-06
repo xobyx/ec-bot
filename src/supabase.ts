@@ -1690,6 +1690,34 @@ export async function unlinkTelegramUser(
   return removed;
 }
 
+export async function setTelegramUserNotifications(
+  env: Env,
+  telegramUserId: number,
+  enabled?: boolean
+): Promise<TelegramAuthorizedUser | null> {
+  const reg = await getTelegramAuthRegistry(env);
+  const existing = reg.users[String(telegramUserId)];
+  if (!existing) return null;
+  const current = existing.notificationsEnabled !== false;
+  existing.notificationsEnabled = typeof enabled === 'boolean' ? enabled : !current;
+  await saveTelegramAuthRegistry(env, reg);
+  return existing;
+}
+
+export async function getNotificationRecipients(
+  env: Env,
+  excludeTelegramUserId?: number
+): Promise<TelegramAuthorizedUser[]> {
+  const reg = await getTelegramAuthRegistry(env);
+  return Object.values(reg.users).filter(
+    u =>
+      u.status === 'approved' &&
+      Boolean(u.chatId) &&
+      u.notificationsEnabled !== false &&
+      (!excludeTelegramUserId || u.telegramUserId !== excludeTelegramUserId)
+  );
+}
+
 // ================= WEBSITE USERS MANAGEMENT (SUPABASE AUTH ADMIN) =================
 
 function mapAuthUserToWebSiteUser(

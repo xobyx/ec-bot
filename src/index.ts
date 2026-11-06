@@ -54,6 +54,8 @@ import {
   requestTelegramAccess,
   setTelegramUserStatus,
   unlinkTelegramUser,
+  setTelegramUserNotifications,
+  getNotificationRecipients,
   listRegisteredWebUsers,
   adminCreateWebUser,
   adminUpdateWebUser,
@@ -120,8 +122,11 @@ export default {
     if (url.pathname === '/api/tg-auth') {
       return handleWebTelegramAuthApi(request, env);
     }
+    if (url.pathname === '/api/notify') {
+      return handleWebNotifyApi(request, env, ctx);
+    }
     if (url.pathname === '/api/test-ai') {
-          return handleTestAiApi(request, env);
+      return handleTestAiApi(request, env);
     }
 
     // 4. Webhook handler: POST / or POST /webhook
@@ -352,9 +357,147 @@ async function handleWebTelegramAuthApi(request: Request, env: Env): Promise<Res
       });
     }
 
+    if (action === 'set_notifications') {
+      const targetTgId = body.telegramUserId ? Number(body.telegramUserId) : undefined;
+      if (!targetTgId) {
+        return jsonResponse({ ok: false, error: 'Missing telegramUserId' }, 400);
+      }
+      const reg = await getTelegramAuthRegistry(env);
+      const target = reg.users[String(targetTgId)];
+      if (!target) {
+        return jsonResponse({ ok: false, error: 'Telegram user not found' }, 404);
+      }
+      if (!webUser.isAdmin && target.supabaseUserId !== webUser.id) {
+        return jsonResponse({ ok: false, error: 'Forbidden' }, 403);
+      }
+      const updated = await setTelegramUserNotifications(
+        env,
+        targetTgId,
+        typeof body.enabled === 'boolean' ? body.enabled : undefined
+      );
+      const updatedReg = await getTelegramAuthRegistry(env);
+      const allList = Object.values(updatedReg.users).sort((a, b) =>
+        (b.linkedAt || '').localeCompare(a.linkedAt || '')
+      );
+      return jsonResponse({
+        ok: true,
+        user: updated,
+        linkedUsers: allList.filter(
+          u =>
+            u.supabaseUserId === webUser.id ||
+            (webUser.email && u.email && u.email.toLowerCase() === webUser.email.toLowerCase())
+        ),
+        allUsers: webUser.isAdmin ? allList : undefined
+      });
+    }
+
     return jsonResponse({ ok: false, error: `Unknown action: ${action}` }, 400);
   } catch (e: any) {
     return jsonResponse({ ok: false, error: e?.message || 'Server error' }, 500);
+  }
+}
+
+async function broadcastBotChangeNotification(
+  env: Env,
+  opts: {
+    source: 'web' | 'telegram';
+    roomId?: string;
+    roomTitle: string;
+    summary: string;
+    by?: string;
+    excludeTelegramUserId?: number;
+  }
+): Promise<number> {
+  if (!env.TELEGRAM_BOT_TOKEN) return 0;
+  try {
+    const recipients = await getNotificationRecipients(env, opts.excludeTelegramUserId);
+    if (!recipients.length) return 0;
+
+    const sourceBadge = opts.source === 'telegram' ? '🤖 Telegram Bot' : '🌐 Web App';
+    const text =
+      `🔔 *Live Site Change (${sourceBadge})*\n\n` +
+      `• *Room:* *${opts.roomTitle}*\n` +
+      `• *Update:* ${opts.summary}\n` +
+      (opts.by ? `• *By:* *${opts.by}*\n` : '');
+
+    const buttons: TelegramInlineKeyboardButton[] = [];
+    if (opts.roomId) {
+      buttons.push({
+        text: '🏠 Open Room Card',
+        callback_data: `b_rm:${opts.roomId}`
+      });
+      buttons.push({
+        text: '🌐 Open in Web',
+        url: `${WEB_APP_BASE}/#/room/${encodeURIComponent(opts.roomId)}`
+      });
+    } else {
+      buttons.push({
+        text: '🌐 Open Web App',
+        url: WEB_APP_BASE
+      });
+    }
+
+    const keyboard: TelegramInlineKeyboardMarkup = {
+      inline_keyboard: [
+        buttons,
+        [{ text: '🔕 Mute Notifications', callback_data: 'tg_notif:off' }]
+      ]
+    };
+
+    let sent = 0;
+    await Promise.all(
+      recipients.map(async u => {
+        if (!u.chatId) return;
+        try {
+          await sendMessage(env.TELEGRAM_BOT_TOKEN, u.chatId, text, {
+            reply_markup: keyboard
+          });
+          sent++;
+        } catch {}
+      })
+    );
+    return sent;
+  } catch (e) {
+    console.warn('broadcastBotChangeNotification error:', e);
+    return 0;
+  }
+}
+
+async function handleWebNotifyApi(
+  request: Request,
+  env: Env,
+  ctx: ExecutionContext
+): Promise<Response> {
+  if (request.method !== 'POST') {
+    return jsonResponse({ ok: false, error: 'Method not allowed' }, 405);
+  }
+  const authHeader = request.headers.get('Authorization') || '';
+  const token = authHeader.replace(/^Bearer\s+/i, '').trim();
+  const webUser = await verifySupabaseUserFromToken(env, token);
+  if (!webUser) {
+    return jsonResponse({ ok: false, error: 'Unauthorized' }, 401);
+  }
+
+  try {
+    const body: any = await request.json().catch(() => ({}));
+    const roomTitle = String(body.roomTitle || body.spaceCode || 'Site Room').trim();
+    const summary = String(body.summary || body.text || 'Room updated').trim();
+    const roomId = body.roomId ? String(body.roomId).trim() : undefined;
+    const by = String(body.by || webUser.displayName || webUser.email || 'Web User').trim();
+
+    ctx.waitUntil(
+      broadcastBotChangeNotification(env, {
+        source: 'web',
+        roomId,
+        roomTitle,
+        summary,
+        by
+      })
+    );
+
+    return jsonResponse({ ok: true });
+  } catch (e: any) {
+    return jsonResponse({ ok: false, error: e?.message || 'Notify error' }, 500);
   }
 }
 
@@ -450,6 +593,8 @@ function buildAccountCard(authUser: TelegramAuthorizedUser): {
       ? 'Project Invitation Code'
       : 'Admin Approval';
 
+  const notifOn = authUser.notificationsEnabled !== false;
+
   const text =
     `👤 *Authenticated Telegram Account*\n\n` +
     `• *Name:* *${authUser.displayName || 'Inspector'}*\n` +
@@ -457,6 +602,7 @@ function buildAccountCard(authUser: TelegramAuthorizedUser): {
     `• *Telegram:* ${authUser.telegramUsername ? `@${authUser.telegramUsername}` : '—'} (\`${authUser.telegramUserId}\`)\n` +
     `• *Role:* ${roleBadge}\n` +
     `• *Auth Method:* ${methodLabel}\n` +
+    `• *Live Alerts:* ${notifOn ? '🔔 *Enabled*' : '🔕 *Muted*'}\n` +
     `• *Linked:* ${authUser.linkedAt ? authUser.linkedAt.slice(0, 10) : 'Active'}\n\n` +
     `_All room finish updates, photos, and snags you send are logged under your name._`;
 
@@ -464,6 +610,12 @@ function buildAccountCard(authUser: TelegramAuthorizedUser): {
     [
       { text: '🧭 Browse Rooms', callback_data: 'b_lvl:all' },
       { text: '📊 Project Status', callback_data: 'b_stats:main' }
+    ],
+    [
+      {
+        text: notifOn ? '🔔 Live Alerts: ON (Tap to Mute)' : '🔕 Live Alerts: OFF (Tap to Enable)',
+        callback_data: `tg_notif:${notifOn ? 'off' : 'on'}`
+      }
     ]
   ];
   if (authUser.role === 'admin') {
@@ -760,6 +912,37 @@ async function handleMessage(message: any, env: Env): Promise<void> {
     return;
   }
 
+  // Command: /notify [on|off]
+  if (/^\/(notify|notifications)(?:@\w+)?(\s|$)/i.test(text)) {
+    const arg = text.replace(/^\/(notify|notifications)(?:@\w+)?/i, '').trim().toLowerCase();
+    const desired =
+      arg === 'on' || arg === 'enable' || arg === 'true'
+        ? true
+        : arg === 'off' || arg === 'disable' || arg === 'mute' || arg === 'false'
+          ? false
+          : undefined;
+    const updated = await setTelegramUserNotifications(env, tgUserId, desired, chatId);
+    const enabled = updated ? updated.notificationsEnabled !== false : true;
+    const statusText = enabled
+      ? `🔔 *Live Change Notifications: ON*\n\nYou will receive instant Telegram alerts whenever rooms, finishes, prep steps, or snags are updated on the Website or via the Bot.`
+      : `🔕 *Live Change Notifications: MUTED*\n\nAutomatic change alerts are paused. Send \`/notify on\` anytime to re-enable.`;
+    await sendMessage(token, chatId, statusText, {
+      reply_markup: {
+        inline_keyboard: [
+          [
+            {
+              text: enabled ? '🔕 Mute Alerts' : '🔔 Enable Alerts',
+              callback_data: `tg_notif:${enabled ? 'off' : 'on'}`
+            },
+            { text: '👤 Account', callback_data: 'tg_acc:0' }
+          ],
+          [{ text: '🏠 Main Menu', callback_data: 'b_lvl:0' }]
+        ]
+      }
+    });
+    return;
+  }
+
   // Command: /users (Admin only)
   if (/^\/users(?:@\w+)?(\s|$)/i.test(text)) {
     if (!isAdmin) {
@@ -788,6 +971,7 @@ async function handleMessage(message: any, env: Env): Promise<void> {
       `• \`/snags\` — View & resolve open snags across the site\n` +
       `• \`/room <code>\` — Open interactive room dashboard\n` +
       `• \`/photos <code>\` — View stored room photos\n` +
+      `• \`/notify\` — Toggle live site & bot change notifications\n` +
       `• \`/whoami\` — View linked account & role`;
     await sendMessage(token, chatId, welcome, { reply_markup: mainMenuKeyboard(isAdmin) });
     return;
@@ -1876,6 +2060,22 @@ async function handleCallbackQuery(query: any, env: Env): Promise<void> {
     return;
   }
 
+  if (actionType === 'tg_notif') {
+    const desired = actionId === 'on' ? true : actionId === 'off' ? false : undefined;
+    const updated = await setTelegramUserNotifications(env, tgUserId, desired, chatId);
+    const enabled = updated ? updated.notificationsEnabled !== false : true;
+    await answerCallbackQuery(
+      token,
+      query.id,
+      enabled ? '🔔 Live alerts enabled!' : '🔕 Live alerts muted'
+    );
+    if (updated && chatId && messageId) {
+      const card = buildAccountCard(updated);
+      await editMessageText(token, chatId, messageId, card.text, { reply_markup: card.keyboard });
+    }
+    return;
+  }
+
   if (actionType === 'tg_unlk') {
     await unlinkTelegramUser(env, { telegramUserId: tgUserId });
     await answerCallbackQuery(token, query.id, 'Account unlinked 🔓');
@@ -2025,6 +2225,14 @@ async function handleCallbackQuery(query: any, env: Env): Promise<void> {
       const microLib = await fetchMicroTaskLibrary(env);
       const card = buildRoomPrepCard(updated.room, finishCode, microLib);
       await editMessageText(token, chatId, messageId, card.text, { reply_markup: card.keyboard });
+      await broadcastBotChangeNotification(env, {
+        source: 'telegram',
+        roomId: updated.room.id,
+        roomTitle: `L${updated.room.level} Z${updated.room.zone} · ${updated.room.num || updated.room.code || updated.room.title}`,
+        summary: `🔧 Prep "${updated.microName}" [${finishCode}] ➔ ${updated.nextStatus.toUpperCase()}`,
+        by: authorName,
+        excludeTelegramUserId: tgUserId
+      });
     } else {
       await answerCallbackQuery(token, query.id, 'Could not update prep step', true);
     }
@@ -2044,6 +2252,14 @@ async function handleCallbackQuery(query: any, env: Env): Promise<void> {
       const microLib = await fetchMicroTaskLibrary(env);
       const card = buildRoomPrepCard(updated.room, finishCode, microLib);
       await editMessageText(token, chatId, messageId, card.text, { reply_markup: card.keyboard });
+      await broadcastBotChangeNotification(env, {
+        source: 'telegram',
+        roomId: updated.room.id,
+        roomTitle: `L${updated.room.level} Z${updated.room.zone} · ${updated.room.num || updated.room.code || updated.room.title}`,
+        summary: `✅ All ${updated.count} prep steps for ${finishCode} marked DONE`,
+        by: authorName,
+        excludeTelegramUserId: tgUserId
+      });
     } else {
       await answerCallbackQuery(token, query.id, 'Could not update prep steps', true);
     }
@@ -2065,6 +2281,14 @@ async function handleCallbackQuery(query: any, env: Env): Promise<void> {
       );
       const card = buildRoomDashboardCard(updated.room, microLib);
       await editMessageText(token, chatId, messageId, card.text, { reply_markup: card.keyboard });
+      await broadcastBotChangeNotification(env, {
+        source: 'telegram',
+        roomId: updated.room.id,
+        roomTitle: `L${updated.room.level} Z${updated.room.zone} · ${updated.room.num || updated.room.code || updated.room.title}`,
+        summary: `${finishCode} (${finishCompactName(finishCode)}) ➔ ${updated.nextStatus.toUpperCase()}`,
+        by: authorName,
+        excludeTelegramUserId: tgUserId
+      });
     } else {
       await answerCallbackQuery(token, query.id, 'Could not update finish', true);
     }
@@ -2082,6 +2306,14 @@ async function handleCallbackQuery(query: any, env: Env): Promise<void> {
       await answerCallbackQuery(token, query.id, 'Snag marked as Resolved ✅');
       const card = buildRoomDashboardCard(res.room, microLib);
       await editMessageText(token, chatId, messageId, card.text, { reply_markup: card.keyboard });
+      await broadcastBotChangeNotification(env, {
+        source: 'telegram',
+        roomId: res.room.id,
+        roomTitle: `L${res.room.level} Z${res.room.zone} · ${res.room.num || res.room.code || res.room.title}`,
+        summary: `✅ Snag resolved`,
+        by: authorName,
+        excludeTelegramUserId: tgUserId
+      });
     } else {
       await answerCallbackQuery(token, query.id, 'Could not resolve snag', true);
     }
@@ -2120,6 +2352,13 @@ async function handleCallbackQuery(query: any, env: Env): Promise<void> {
           `↩️ *Update Reverted*\n\nRoom *${res.roomTitle}* was restored to its previous state.`,
           { reply_markup: mainMenuKeyboard() }
         );
+        await broadcastBotChangeNotification(env, {
+          source: 'telegram',
+          roomTitle: res.roomTitle,
+          summary: `↩️ Update reverted to previous state`,
+          by: authorName,
+          excludeTelegramUserId: tgUserId
+        });
       } else {
         await answerCallbackQuery(token, query.id, 'Undo snapshot expired or already used', true);
       }
@@ -2386,6 +2625,34 @@ async function handleCallbackQuery(query: any, env: Env): Promise<void> {
           reply_markup: { inline_keyboard: postButtons }
         });
       }
+
+      const summaryParts: string[] = [];
+      if (result.appliedMicro) {
+        summaryParts.push(
+          `🔧 Prep "${result.appliedMicro.name}"${result.appliedFinish ? ` [${result.appliedFinish}]` : ''} ➔ ${result.appliedMicro.status.toUpperCase()}`
+        );
+      } else if (result.appliedFinish && pending.parsed.status) {
+        summaryParts.push(
+          `${result.appliedFinish} (${finishCompactName(result.appliedFinish)}) ➔ ${pending.parsed.status.toUpperCase()}`
+        );
+      }
+      if (pending.parsed.snag) {
+        summaryParts.push(`⚠️ Snag (${pending.parsed.snag.trade}): "${pending.parsed.snag.text}"`);
+      }
+      if (photoId) {
+        summaryParts.push(`📷 Photo uploaded`);
+      }
+      if (summaryParts.length === 0 && pending.parsed.summary) {
+        summaryParts.push(pending.parsed.summary);
+      }
+      await broadcastBotChangeNotification(env, {
+        source: 'telegram',
+        roomId: result.room.id,
+        roomTitle: result.roomTitle,
+        summary: summaryParts.join(' · ') || 'Room updated via Telegram',
+        by: pending.fromUser || authorName,
+        excludeTelegramUserId: tgUserId
+      });
     } catch (err: any) {
       console.error('Failed to apply update:', err);
       if (chatId && messageId) {

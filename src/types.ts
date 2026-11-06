@@ -202,6 +202,7 @@ export interface TelegramAuthorizedUser {
   displayName?: string;
   linkedAt: string;
   approvedBy?: string;
+  notificationsEnabled?: boolean;
 }
 
 export interface TelegramLinkCode {
