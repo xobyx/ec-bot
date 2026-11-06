@@ -100,6 +100,7 @@ export const COMPACT_DESCS: Record<string, string> = {
   F14A: 'Carpet Tiles',
   F15: 'Marble',
   F16: 'Porcelain Pavers',
+  F55: 'Waterproofing',
 
   // Walls
   W01: 'Bare Blockwork',
@@ -182,6 +183,7 @@ export const SHORT_DESCS: Record<string, string> = {
   F14A: '60x60 carpet tiles',
   F15: '20mm polished marble',
   F16: '20mm porcelain pavers',
+  F55: 'Wet area waterproofing membrane',
 
   // Walls
   W01: 'Bare face concrete / blockwork',
