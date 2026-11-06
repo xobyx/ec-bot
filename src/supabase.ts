@@ -522,8 +522,24 @@ export async function resolveRoomCandidates(
   }
 
   if (cleanSpace && cleanSpace !== 'SITE' && cleanSpace !== 'ROOM') {
+    const exactSpaceMatches = levelRooms.filter(
+      r => (r.space || '').trim().toUpperCase() === cleanSpace
+    );
+    if (exactSpaceMatches.length === 1) {
+      const exact = exactSpaceMatches[0];
+      parsed.zone = exact.zone;
+      parsed.space = exact.space;
+      parsed.spaceCode = exact.spaceCode || exact.spaceNo;
+      return { exact, candidates: [exact] };
+    }
+    if (exactSpaceMatches.length > 1) {
+      return { exact: null, candidates: exactSpaceMatches };
+    }
+
     const matched = levelRooms.filter(r => {
-      const rs = (r.space || '').toUpperCase();
+      const rs = (r.space || '').trim().toUpperCase();
+      if (cleanSpace.startsWith('MALE') && rs.includes('FEMALE')) return false;
+      if (rs.startsWith('MALE') && cleanSpace.includes('FEMALE')) return false;
       return rs === cleanSpace || rs.includes(cleanSpace) || cleanSpace.includes(rs);
     });
 
