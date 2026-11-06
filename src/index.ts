@@ -2228,7 +2228,7 @@ async function handleCallbackQuery(query: any, env: Env): Promise<void> {
       await broadcastBotChangeNotification(env, {
         source: 'telegram',
         roomId: updated.room.id,
-        roomTitle: `L${updated.room.level} Z${updated.room.zone} · ${updated.room.num || updated.room.code || updated.room.title}`,
+        roomTitle: `L${updated.room.level} Z${updated.room.zone} · ${updated.room.spaceCode || updated.room.spaceNo || ''} — ${updated.room.space}`,
         summary: `🔧 Prep "${updated.microName}" [${finishCode}] ➔ ${updated.nextStatus.toUpperCase()}`,
         by: authorName,
         excludeTelegramUserId: tgUserId
@@ -2255,7 +2255,7 @@ async function handleCallbackQuery(query: any, env: Env): Promise<void> {
       await broadcastBotChangeNotification(env, {
         source: 'telegram',
         roomId: updated.room.id,
-        roomTitle: `L${updated.room.level} Z${updated.room.zone} · ${updated.room.num || updated.room.code || updated.room.title}`,
+        roomTitle: `L${updated.room.level} Z${updated.room.zone} · ${updated.room.spaceCode || updated.room.spaceNo || ''} — ${updated.room.space}`,
         summary: `✅ All ${updated.count} prep steps for ${finishCode} marked DONE`,
         by: authorName,
         excludeTelegramUserId: tgUserId
@@ -2284,7 +2284,7 @@ async function handleCallbackQuery(query: any, env: Env): Promise<void> {
       await broadcastBotChangeNotification(env, {
         source: 'telegram',
         roomId: updated.room.id,
-        roomTitle: `L${updated.room.level} Z${updated.room.zone} · ${updated.room.num || updated.room.code || updated.room.title}`,
+        roomTitle: `L${updated.room.level} Z${updated.room.zone} · ${updated.room.spaceCode || updated.room.spaceNo || ''} — ${updated.room.space}`,
         summary: `${finishCode} (${finishCompactName(finishCode)}) ➔ ${updated.nextStatus.toUpperCase()}`,
         by: authorName,
         excludeTelegramUserId: tgUserId
@@ -2309,7 +2309,7 @@ async function handleCallbackQuery(query: any, env: Env): Promise<void> {
       await broadcastBotChangeNotification(env, {
         source: 'telegram',
         roomId: res.room.id,
-        roomTitle: `L${res.room.level} Z${res.room.zone} · ${res.room.num || res.room.code || res.room.title}`,
+        roomTitle: `L${res.room.level} Z${res.room.zone} · ${res.room.spaceCode || res.room.spaceNo || ''} — ${res.room.space}`,
         summary: `✅ Snag resolved`,
         by: authorName,
         excludeTelegramUserId: tgUserId
