@@ -32,6 +32,7 @@ import {
   getRoomsForLevelZone,
   resolveRoomCandidates,
   resolveFinishCodeForRoom,
+  alignParsedWithRoom,
   applyUpdateToRoom,
   quickCycleRoomFinish,
   closeRoomSnag,
@@ -859,11 +860,11 @@ async function handleMessage(message: any, env: Env): Promise<void> {
     return;
   }
 
-  // Check if user replied to a previous bot message mentioning a room code (e.g., GF-008, F1-040C)
+  // Check if user replied to a previous bot message mentioning a room code (e.g., G-008, GF-008, F1-040C, F3-98)
   let replyContextCode: string | null = null;
   const replyText = message.reply_to_message?.text || message.reply_to_message?.caption || '';
   if (replyText) {
-    const m = replyText.match(/\b(GF-\d{2,4}[A-Z]?|F[1-8]-\d{2,4}[A-Z]?)\b/i);
+    const m = replyText.match(/\b(G(?:F)?-\d{1,4}[A-Z]?|F[1-8]-\d{1,4}[A-Z]?)\b/i);
     if (m) {
       replyContextCode = normalizeScheduleCodeInput(m[1]);
     }
@@ -1389,8 +1390,8 @@ async function buildInteractivePrompt(
   const engineLabel =
     parsed.aiEngine?.startsWith('Gemini')
       ? `✨ ${parsed.aiEngine}`
-      : parsed.aiEngine === 'Cloudflare AI'
-        ? '☁️ Cloudflare AI'
+      : parsed.aiEngine?.startsWith('Cloudflare AI')
+        ? `☁️ ${parsed.aiEngine}`
         : '⚡ Heuristic';
   const engineLine = `• *Parser:* *${engineLabel}*\n`;
 
@@ -1560,16 +1561,7 @@ async function buildInteractivePrompt(
   }
 
   const room = resolved.exact;
-  const alignedFinish = resolveFinishCodeForRoom(
-    room,
-    parsed.finishCode,
-    parsed.finishKind,
-    parsed.microTask?.id || null,
-    microLib
-  );
-  if (alignedFinish) {
-    parsed.finishCode = alignedFinish;
-  }
+  alignParsedWithRoom(room, parsed, microLib);
 
   // ================= OPTIONAL: PICK PREP STEP (MICRO-TASK) =================
   if (mode === 'pick_micro') {
@@ -2529,6 +2521,10 @@ async function handleTestAiApi(request: Request, env: Env): Promise<Response> {
 
       createdAt: new Date().toISOString()
     }).catch(() => null);
+
+    if (resolvedCandidates?.exact) {
+      alignParsedWithRoom(resolvedCandidates.exact, parsed, microLib);
+    }
 
     return jsonResponse({
       ok: true,

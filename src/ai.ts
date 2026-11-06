@@ -103,11 +103,75 @@ export function normalizeScheduleCodeInput(raw: string | null | undefined): stri
   if (!raw) return null;
   const s = String(raw).trim().toUpperCase();
   if (!s || /^[ZLF]\d$/i.test(s)) return null;
-  const m = s.match(/^(GF|F[1-8])[-\s]?(\d{2,4}[A-Z]?)$/i);
+  // Do not treat finish codes like F01, F02, F08, F09A, F14A (without hyphen) as room codes
+  if (/^[FWCS]\d{2}[A-Z]?$/i.test(s)) return null;
+
+  const m = s.match(/^(G|GF|F0|L0|F[1-8]|L[1-8])[-\s]?(\d{1,4})([A-Z]?)$/i);
   if (m) {
-    return `${m[1].toUpperCase()}-${m[2].toUpperCase()}`;
+    const rawPrefix = m[1].toUpperCase();
+    const prefix =
+      rawPrefix === 'G' || rawPrefix === 'GF' || rawPrefix === 'F0' || rawPrefix === 'L0'
+        ? 'G'
+        : `F${rawPrefix.slice(-1)}`;
+    const num = parseInt(m[2], 10);
+    const suffix = (m[3] || '').toUpperCase();
+    // Toilets on F2..F8 with numbers 96..99 use 2-digit codes (e.g. F2-96, F3-98); all other rooms use 3-digit zero-padded codes (e.g. G-008, F3-066)
+    const isUpperToilet = prefix !== 'G' && prefix !== 'F1' && num >= 96 && num <= 99 && !suffix;
+    const padded = isUpperToilet ? String(num) : String(num).padStart(3, '0');
+    return `${prefix}-${padded}${suffix}`;
   }
   return s;
+}
+
+export function canonicalizeMicroTokens(raw: string): string[] {
+  const s = String(raw || '')
+    .toLowerCase()
+    // normalize common site typos & abbreviations
+    .replace(/\bwater\s*pro+f(?:ing)?\b/g, 'waterproofing')
+    .replace(/\bw\.?\s*p\.?\b/g, 'waterproofing')
+    .replace(/\bprep(?:aration|ration|are|ar|ared|aring)?\b/g, 'prepare')
+    .replace(/\bprepration\b/g, 'prepare')
+    .replace(/\bsusbuntion\b|\bsuspention\b|\bsuspension\b/g, 'suspension')
+    .replace(/\bfloot\b/g, 'floor')
+    .replace(/\bclearanc(?:e)?\b/g, 'clearance')
+    .replace(/\bma?3?j+o+n\b|\bputty\b/g, 'm3joon')
+    .replace(/\bmov(?:e)?ment\b/g, 'movement')
+    .replace(/\blev(?:e)?l(?:ing|ling)?\b/g, 'leveling')
+    .replace(/\bisolat(?:ion)?\b|\binsulat(?:ion)?\b/g, 'isolation');
+
+  const stopWords = new Set([
+    'done', 'ongoing', 'pending', 'complete', 'completed', 'finished', 'started',
+    'in', 'progress', 'for', 'room', 'rm', 'zone', 'level', 'floor', 'wall', 'ceiling',
+    'the', 'is', 'are', 'and', 'with', 'to', 'on', 'at', 'of', 'ok', 'passed', 'ready'
+  ]);
+
+  return s
+    .split(/[^a-z0-9]+/)
+    .filter(tok => tok.length >= 2 && !stopWords.has(tok) && !/^(gf|f[1-8]|l[0-8]|z[1-4]|\d+[a-z]?)$/i.test(tok));
+}
+
+function tokenSimilarity(a: string, b: string): number {
+  if (a === b) return 1;
+  if (a.startsWith(b) || b.startsWith(a)) {
+    const minLen = Math.min(a.length, b.length);
+    if (minLen >= 4) return 0.9;
+  }
+  // Simple Levenshtein distance for typo tolerance (e.g. profing vs proofing)
+  const m = a.length;
+  const n = b.length;
+  if (Math.abs(m - n) > 3) return 0;
+  const dp: number[][] = Array.from({ length: m + 1 }, () => Array(n + 1).fill(0));
+  for (let i = 0; i <= m; i++) dp[i][0] = i;
+  for (let j = 0; j <= n; j++) dp[0][j] = j;
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      dp[i][j] = Math.min(dp[i - 1][j] + 1, dp[i][j - 1] + 1, dp[i - 1][j - 1] + cost);
+    }
+  }
+  const dist = dp[m][n];
+  const maxLen = Math.max(m, n);
+  return maxLen > 0 ? 1 - dist / maxLen : 0;
 }
 
 export function resolveMicroTaskFromLibrary(
@@ -122,11 +186,53 @@ export function resolveMicroTaskFromLibrary(
   const lib = microLib?.library || [];
   const templates = microLib?.codeTemplates || {};
   const norm = (s: string) =>
-    String(s || '')
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, '');
+    canonicalizeMicroTokens(s).join('');
 
   let matched: { id: string; name: string } | null = null;
+
+  const findBestInLib = (queryText: string): { id: string; name: string } | null => {
+    if (!queryText || !lib.length) return null;
+    const qTokens = canonicalizeMicroTokens(queryText);
+    if (!qTokens.length) return null;
+
+    let bestItem: { id: string; name: string } | null = null;
+    let bestScore = 0;
+
+    for (const item of lib) {
+      const itemTokens = canonicalizeMicroTokens(item.name);
+      if (!itemTokens.length) continue;
+
+      // Check how many of itemTokens are matched by qTokens
+      let matchedCount = 0;
+      let similaritySum = 0;
+      for (const iTok of itemTokens) {
+        let bestTokSim = 0;
+        for (const qTok of qTokens) {
+          const sim = tokenSimilarity(iTok, qTok);
+          if (sim > bestTokSim) bestTokSim = sim;
+        }
+        if (bestTokSim >= 0.72) {
+          matchedCount++;
+          similaritySum += bestTokSim;
+        }
+      }
+
+      // Require all tokens of the micro-task name (or at least 2 tokens if name has >=3 tokens) to match
+      const coverage = matchedCount / itemTokens.length;
+      if (coverage < 0.99 && !(itemTokens.length >= 3 && matchedCount >= 2)) {
+        continue;
+      }
+
+      // Prefer more specific matches (more tokens matched, e.g., "waterproofing + prepare" over just "waterproofing")
+      const score = matchedCount * 10 + similaritySum + coverage;
+      if (score > bestScore) {
+        bestScore = score;
+        bestItem = { id: item.id, name: item.name };
+      }
+    }
+
+    return bestItem;
+  };
 
   // 1. Check AI-provided microTask first
   if (rawMicro) {
@@ -141,17 +247,13 @@ export function resolveMicroTaskFromLibrary(
     if (lib.length > 0) {
       const byExactId = rawId ? lib.find(m => m.id === rawId) : undefined;
       const byExactName = rawName
-        ? lib.find(m => m.name.toLowerCase() === rawName.toLowerCase())
+        ? lib.find(m => m.name.toLowerCase().trim() === rawName.toLowerCase().trim())
         : undefined;
       const byNormName = rawName
-        ? lib.find(
-            m =>
-              norm(m.name) === norm(rawName) ||
-              norm(m.name).includes(norm(rawName)) ||
-              norm(rawName).includes(norm(m.name))
-          )
+        ? lib.find(m => norm(m.name) && norm(m.name) === norm(rawName))
         : undefined;
-      const found = byExactId || byExactName || byNormName;
+      const byFuzzy = rawName ? findBestInLib(rawName) : null;
+      const found = byExactId || byExactName || byNormName || byFuzzy;
       if (found) {
         matched = { id: found.id, name: found.name };
       }
@@ -162,17 +264,16 @@ export function resolveMicroTaskFromLibrary(
     }
   }
 
-  // 2. Fallback: scan user text for known micro-tasks in library
-  if (!matched && text && lib.length > 0) {
-    const lowerText = text.toLowerCase();
-    const normText = norm(text);
-    const sortedLib = [...lib].sort((a, b) => b.name.length - a.name.length);
-    for (const item of sortedLib) {
-      const itemLower = item.name.toLowerCase().trim();
-      const itemNorm = norm(item.name);
-      if (itemLower.length >= 3 && (lowerText.includes(itemLower) || (itemNorm.length >= 5 && normText.includes(itemNorm)))) {
-        matched = { id: item.id, name: item.name };
-        break;
+  // 2. Always check user text directly as well: if user text matches a MORE specific micro-task
+  //    (e.g. "water profing prep" -> "water proofing prepare" vs AI returning null or generic "water proofing"), use it!
+  if (text && lib.length > 0) {
+    const fromText = findBestInLib(text);
+    if (fromText) {
+      if (
+        !matched ||
+        canonicalizeMicroTokens(fromText.name).length > canonicalizeMicroTokens(matched.name).length
+      ) {
+        matched = fromText;
       }
     }
   }
@@ -222,6 +323,7 @@ async function analyzeWithWorkersAI(
 
   try {
     let result: any;
+    let modelLabel = 'Cloudflare AI';
     if (imageBytes && imageBytes.length > 0) {
       const imageArray = [...imageBytes];
       result = await ai.run('@cf/meta/llama-3.2-11b-vision-instruct', {
@@ -229,20 +331,33 @@ async function analyzeWithWorkersAI(
         image: imageArray,
         max_tokens: 512
       });
+      modelLabel = 'Cloudflare AI (Llama 3.2 11B Vision)';
     } else {
-      result = await ai.run('@cf/meta/llama-3.2-3b-instruct', {
-        messages: [
-          { role: 'system', content: SYSTEM_PROMPT },
-          { role: 'user', content: promptText }
-        ],
-        max_tokens: 512
-      });
+      try {
+        result = await ai.run('@cf/meta/llama-3.3-70b-instruct-fp8-fast', {
+          messages: [
+            { role: 'system', content: SYSTEM_PROMPT },
+            { role: 'user', content: promptText }
+          ],
+          max_tokens: 512
+        });
+        modelLabel = 'Cloudflare AI (Llama 3.3 70B)';
+      } catch {
+        result = await ai.run('@cf/meta/llama-3.2-3b-instruct', {
+          messages: [
+            { role: 'system', content: SYSTEM_PROMPT },
+            { role: 'user', content: promptText }
+          ],
+          max_tokens: 512
+        });
+        modelLabel = 'Cloudflare AI (Llama 3.2 3B)';
+      }
     }
 
     const rawResp = result?.response ?? result;
     const responseText =
       typeof rawResp === 'string' ? rawResp : JSON.stringify(rawResp || {});
-    return parseCleanJson(responseText, text, result, microLib, 'Cloudflare AI');
+    return parseCleanJson(responseText, text, result, microLib, modelLabel, Boolean(imageBytes && imageBytes.length > 0));
   } catch (err: any) {
     console.error('Workers AI execution error:', err);
     return fallbackHeuristicParser(text, microLib);
@@ -301,9 +416,14 @@ async function analyzeWithGemini(
       if (res.ok) {
         const data: any = await res.json();
         const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
-        return parseCleanJson(rawText, text, data, microLib, `Gemini (${model})`);
+        return parseCleanJson(rawText, text, data, microLib, `Gemini (${model})`, Boolean(imageBytes && imageBytes.length > 0));
       }
-      lastErr = new Error(`Gemini API error (${model}): ${res.status} ${await res.text()}`);
+      const errBody = await res.text();
+      lastErr = new Error(`Gemini API error (${model}): ${res.status} ${errBody}`);
+      // Project-wide auth/billing failure (401/402/403): don't waste time retrying other Gemini models
+      if (res.status === 401 || res.status === 402 || res.status === 403) {
+        break;
+      }
     } catch (fetchErr: any) {
       lastErr = fetchErr;
     }
@@ -334,7 +454,8 @@ function parseCleanJson(
   fallbackText: string,
   org?: any,
   microLib?: MicroTaskLibrary,
-  aiEngine = 'AI'
+  aiEngine = 'AI',
+  hasImage = false
 ): ParsedSiteUpdate {
   try {
     const parsed = extractJsonObject(raw);
@@ -345,17 +466,30 @@ function parseCleanJson(
     );
 
     let level: number | null = typeof parsed.level === 'number' ? parsed.level : heuristic.level;
-    const zone: number | null = typeof parsed.zone === 'number' ? parsed.zone : heuristic.zone;
+    const zone: number | null =
+      hasImage && typeof parsed.zone === 'number'
+        ? parsed.zone
+        : heuristic.zone !== null
+          ? heuristic.zone
+          : null;
 
     if (level === null && cleanSpaceCode) {
-      if (/^GF-\d+/i.test(cleanSpaceCode)) level = 0;
+      if (/^G(?:F)?-\d+/i.test(cleanSpaceCode)) level = 0;
       else {
         const m = cleanSpaceCode.match(/^F(\d)-\d+/i);
         if (m) level = parseInt(m[1], 10);
       }
     }
 
-    const space = (parsed.space && parsed.space !== 'SITE' ? String(parsed.space).toUpperCase() : null) || heuristic.space;
+    let rawAiSpace = parsed.space ? String(parsed.space).trim().toUpperCase() : null;
+    if (rawAiSpace) {
+      rawAiSpace = rawAiSpace
+        .replace(/\b(?:FAMALE|WOMAN|WOMEN|LADIES|LADY)\s*(?:TOILETS?|TOLITES?|TOLETS?|WC)\b/g, 'FEMALE TOILET')
+        .replace(/\b(?:MAN|MEN|GENTS)\s*(?:TOILETS?|TOLITES?|TOLETS?|WC)\b/g, 'MALE TOILET')
+        .replace(/\b(?:TOLITES?|TOLETS?|TOILETS)\b/g, 'TOILET');
+    }
+    const invalidSpaces = new Set(['SITE', 'ROOM', 'FLOOR', 'WALL', 'CEILING', 'SKIRTING', 'NONE', 'NULL', 'UNKNOWN']);
+    const space = (rawAiSpace && !invalidSpaces.has(rawAiSpace) ? rawAiSpace : null) || heuristic.space;
     const rawFinishCode = (parsed.finishCode ? String(parsed.finishCode).toUpperCase() : null) || heuristic.finishCode;
     const status = ['pending', 'ongoing', 'done'].includes(parsed.status)
       ? parsed.status
@@ -368,6 +502,17 @@ function parseCleanJson(
       microLib
     );
     const finishCode = inferredFinishCode || rawFinishCode;
+    const pChar = finishCode ? finishCode.charAt(0).toUpperCase() : '';
+    const finishKind =
+      pChar === 'F'
+        ? 'Floor'
+        : pChar === 'W'
+          ? 'Wall'
+          : pChar === 'C'
+            ? 'Ceiling'
+            : pChar === 'S'
+              ? 'Skirting'
+              : parsed.finishKind || heuristic.finishKind || null;
 
     return {
       level,
@@ -376,7 +521,7 @@ function parseCleanJson(
       spaceNo: cleanSpaceCode,
       spaceCode: cleanSpaceCode,
       finishCode,
-      finishKind: parsed.finishKind || heuristic.finishKind || null,
+      finishKind,
       status,
       snag:
         parsed.snag && parsed.snag.text
@@ -398,22 +543,31 @@ function parseCleanJson(
 }
 
 const KNOWN_SPACES = [
-  '2.40 M SERVICE CORRIDOR', 'SERVICE LIFT LOBBY', 'FM OFFICE & STORE', 'FM OFFICE PANTRY',
-  'GARBAGE ROOM', 'GARBAGE CHUTE', 'POD TOILET', 'MALE TOILET', 'FEMALE TOILET', 'TOILET',
-  'CORRIDOR', 'JANITOR', 'STORE ROOM', 'AHU ROOM', 'ELEC. ROOM', 'ELEC. CABINET', 'ELV. RM.',
-  'LIFT LOBBY', 'STAIRCASE', 'AUDITORIUM', 'PRODUCTION ROOM', 'CCU ROOM', 'GENERATOR ROOM',
-  'IDF RM', 'SERVER ROOM', 'KITCHEN', 'PANTRY', 'MEP SHAFT', 'MEP', 'P.SHAFT', 'SHAFT', 'F.H.R.'
+  '2.40 M SERVICE CORRIDOR', 'MAIN ENTRANCE LOBBY & ATRIUM', 'LOADING & UNLOADING LOBBY',
+  'FEMALE STAFF TOILET', 'MALE STAFF TOILET', 'SERVICE LIFT LOBBY', 'SERVICE LIFT SHAFT',
+  'FM OFFICE & STORE', 'FM OFFICE PANTRY', 'SECURITY GUARD RM', 'G. SERVICE ROOM',
+  'GARBAGE ROOM', 'GARBAGE CHUTE', 'DRIVER TOILET', 'POD TOILET', 'MALE TOILET', 'FEMALE TOILET',
+  'TOILET CORRIDOR', 'TOILET', 'CORRIDOR', 'JANITOR', 'STORE ROOM', 'AHU ROOM', 'ELEC. ROOM',
+  'ELEC. CABINET', 'ELV. RM.', 'LIFT LOBBY', 'STAIRCASE', 'AUDITORIUM', 'PRODUCTION ROOM',
+  'CCU ROOM', 'GENERATOR ROOM', 'IDF RM', 'SERVER ROOM', 'KITCHEN', 'PANTRY', 'F&B OUTLET',
+  'OFFICE SPACE', 'MEP SHAFT', 'MEP', 'P.SHAFT', 'SHAFT', 'F.H.R.'
 ];
 
 export function fallbackHeuristicParser(
   text: string,
   microLib?: MicroTaskLibrary
 ): ParsedSiteUpdate {
-  const upper = (text || '').toUpperCase();
+  const upper = (text || '')
+    .toUpperCase()
+    .replace(/\b(?:FAMALE|WOMAN|WOMEN|LADIES|LADY)\s*(?:TOILETS?|TOLITES?|TOLETS?|WC)\b/g, 'FEMALE TOILET')
+    .replace(/\b(?:MAN|MEN|GENTS)\s*(?:TOILETS?|TOLITES?|TOLETS?|WC)\b/g, 'MALE TOILET')
+    .replace(/\b(?:TOLITES?|TOLETS?|TOILETS)\b/g, 'TOILET');
 
-  // 1. Match explicit Room Code like GF-008, GF008, F1-021, F1-040C, F4-041
+  // 1. Match explicit Room Code like G-008, GF-008, GF008, F1-021, F3-66, F1-040C, F4-041
   let spaceCode: string | null = null;
-  const schedCodeMatch = upper.match(/\b(GF[-\s]?\d{2,4}[A-Z]?|F[1-8][-\s]?\d{2,4}[A-Z]?)\b/i);
+  const schedCodeMatch = upper.match(
+    /\b((?:G|GF)[-\s]?\d{1,4}[A-Z]?|(?:F|L)[0-8]-\d{1,4}[A-Z]?|(?:F|L)[1-8]\s+\d{2,4}[A-Z]?|(?:F|L)[1-8]\d{3,4}[A-Z]?)\b/i
+  );
   if (schedCodeMatch) {
     spaceCode = normalizeScheduleCodeInput(schedCodeMatch[1]);
   }
@@ -429,7 +583,7 @@ export function fallbackHeuristicParser(
     }
   }
   if (level === null && spaceCode) {
-    if (spaceCode.startsWith('GF-')) level = 0;
+    if (/^G(?:F)?-/.test(spaceCode)) level = 0;
     else {
       const m = spaceCode.match(/^F(\d)-/);
       if (m) level = parseInt(m[1], 10);

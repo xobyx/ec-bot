@@ -12,9 +12,10 @@ import type {
   TelegramLinkCode,
   TelegramAuthRegistry,
     WebSiteUser,
-  MicroTaskLibrary
+  MicroTaskLibrary,
+  ParsedSiteUpdate
 } from './types';
-import { normalizeScheduleCodeInput } from './ai';
+import { normalizeScheduleCodeInput, canonicalizeMicroTokens } from './ai';
 
 export const TG_AUTH_REGISTRY_KEY = 'tg_auth_registry';
 
@@ -650,6 +651,69 @@ export function resolveFinishCodeForRoom(
   }
 
   return finishCode || roomCodes[0] || null;
+}
+
+export function alignParsedWithRoom(
+  room: Room,
+  parsed: ParsedSiteUpdate,
+  microLib?: MicroTaskLibrary
+): void {
+  const roomCodes = Object.keys(room.checks || {});
+  const roomStepEntries: Array<{ code: string; id: string; name: string }> = [];
+  for (const c of roomCodes) {
+    const micros = getRoomFinishMicroTasks(room, c, microLib);
+    for (const m of micros) {
+      roomStepEntries.push({ code: c, id: m.id, name: m.name });
+    }
+  }
+
+  // If microTask is present or notes mention a room-specific step, align to the exact step ID present on this room
+  if (roomStepEntries.length > 0) {
+    if (parsed.microTask) {
+      const hasExactId = roomStepEntries.some(e => e.id === parsed.microTask!.id);
+      if (!hasExactId) {
+        const targetSig = canonicalizeMicroTokens(parsed.microTask.name).join(' ');
+        const bySig = roomStepEntries.find(
+          e => canonicalizeMicroTokens(e.name).join(' ') === targetSig
+        );
+        if (bySig) {
+          parsed.microTask = { id: bySig.id, name: bySig.name };
+        }
+      }
+    } else if (parsed.notes) {
+      const noteTokens = new Set(canonicalizeMicroTokens(parsed.notes));
+      let bestEntry: { code: string; id: string; name: string } | null = null;
+      let bestScore = 0;
+      for (const e of roomStepEntries) {
+        const eTokens = canonicalizeMicroTokens(e.name);
+        if (!eTokens.length) continue;
+        const matched = eTokens.filter(t => noteTokens.has(t)).length;
+        if (matched === eTokens.length && matched > bestScore) {
+          bestScore = matched;
+          bestEntry = e;
+        }
+      }
+      if (bestEntry) {
+        parsed.microTask = { id: bestEntry.id, name: bestEntry.name };
+      }
+    }
+  }
+
+  const alignedFinish = resolveFinishCodeForRoom(
+    room,
+    parsed.finishCode,
+    parsed.finishKind,
+    parsed.microTask?.id || null,
+    microLib
+  );
+  if (alignedFinish) {
+    parsed.finishCode = alignedFinish;
+    if (alignedFinish !== 'ALL') {
+      const p = alignedFinish.charAt(0).toUpperCase();
+      parsed.finishKind =
+        p === 'F' ? 'Floor' : p === 'W' ? 'Wall' : p === 'C' ? 'Ceiling' : p === 'S' ? 'Skirting' : parsed.finishKind;
+    }
+  }
 }
 
 export async function applyUpdateToRoom(
