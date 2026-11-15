@@ -82,6 +82,7 @@ import {
 } from './supabase';
 
 const WEB_APP_BASE = 'https://ecit-tracker.pages.dev';
+const WORKER_BASE = 'https://ec-bot.xobyx.workers.dev';
 const BOT_USERNAME = 'ec20026bot';
 
 const CORS_HEADERS: Record<string, string> = {
@@ -157,6 +158,9 @@ export default {
     }
     if (url.pathname === '/api/test-ai') {
       return handleTestAiApi(request, env);
+    }
+    if (url.pathname === '/api/test-widget') {
+      return handleTestWidgetApi(request, env);
     }
 
     // 4. Webhook handler: POST / or POST /webhook
@@ -1702,10 +1706,11 @@ function buildRoomDashboardCard(
   }
 
   // Photos, Live Widget & Web App link row
+  const roomQueryParam = encodeURIComponent(room.spaceCode || room.spaceNo || room.id);
   const actionRow: TelegramInlineKeyboardButton[] = [
     {
-      text: '🧩 Live Widget',
-      callback_data: `b_wrm:${room.id}`
+      text: '🧩 Quick Widget',
+      web_app: { url: `${WORKER_BASE}/api/test-widget?mode=preview&type=room&room=${roomQueryParam}` }
     }
   ];
   if ((room.photos || []).length > 0) {
@@ -1832,7 +1837,10 @@ async function buildStatsCard(env: Env): Promise<{ text: string; keyboard: Teleg
         row1,
         row2,
         [
-          { text: '🧩 Live KPI Widget', callback_data: 'b_wstat:0' },
+          {
+            text: '🧩 Live KPI Widget',
+            web_app: { url: `${WORKER_BASE}/api/test-widget?mode=preview&type=stats` }
+          },
           { text: '🔄 Refresh Stats', callback_data: 'b_stats:refresh' },
           { text: `⚠️ Snags (${stats.openSnags})`, callback_data: 'b_snags:0' }
         ]
@@ -3224,4 +3232,358 @@ async function handleTestAiApi(request: Request, env: Env): Promise<Response> {
       stack: err?.stack
     }, 500);
   }
+}
+
+async function handleTestWidgetApi(request: Request, env: Env): Promise<Response> {
+  const url = new URL(request.url);
+
+  // Interactive query handler for the browser simulator & Quick Widget Mini App
+  if (request.method === 'POST') {
+    try {
+      const body: any = await request.json().catch(() => ({}));
+      const data = String(body.query || body.data || '').trim();
+      const initData = String(body.initData || '').trim();
+      let authorName = 'Widget Simulator';
+      let tgUserId: number | undefined = undefined;
+
+      if (initData && env.TELEGRAM_BOT_TOKEN) {
+        const verified = await verifyTelegramWebAppInitData(env.TELEGRAM_BOT_TOKEN, initData);
+        if (verified.ok && verified.user?.id) {
+          tgUserId = verified.user.id;
+          const authUser = await getAuthorizedTelegramUser(env, tgUserId);
+          if (!authUser || authUser.status !== 'approved') {
+            return jsonResponse({ ok: false, error: 'NOT_ALLOWED' }, 403);
+          }
+          authorName = formatTelegramAuthorLabel(authUser, verified.user);
+        }
+      }
+
+      if (data === 'wstat:refresh') {
+        const stats = await getProjectStats(env);
+        const stateJson = buildStatsWidgetState(stats);
+        return jsonResponse({ ok: true, result: stateJson });
+      }
+
+      const parts = data.split(':');
+      const cmd = parts[0];
+      const roomId = parts[1] || '';
+
+      if (cmd === 'wr' && roomId) {
+        const [room, microLib] = await Promise.all([
+          getRoomByIdOrCode(env, roomId),
+          fetchMicroTaskLibrary(env)
+        ]);
+        if (!room) return jsonResponse({ ok: false, error: 'Room not found' }, 404);
+        return jsonResponse({ ok: true, result: buildRoomWidgetState(room, microLib) });
+      }
+
+      if (cmd === 'wf' && roomId && parts[2]) {
+        const finishCode = parts[2];
+        const [updated, microLib] = await Promise.all([
+          quickCycleRoomFinish(env, roomId, finishCode, authorName),
+          fetchMicroTaskLibrary(env)
+        ]);
+        if (!updated) return jsonResponse({ ok: false, error: 'Update failed' }, 400);
+        await broadcastBotChangeNotification(env, {
+          source: 'telegram',
+          roomId: updated.room.id,
+          roomTitle: `L${updated.room.level} Z${updated.room.zone} · ${updated.room.spaceCode || updated.room.spaceNo || ''} — ${updated.room.space}`,
+          summary: `${finishCode} (${finishCompactName(finishCode)}) ➔ ${updated.nextStatus.toUpperCase()}`,
+          by: authorName,
+          excludeTelegramUserId: tgUserId
+        });
+        return jsonResponse({ ok: true, result: buildRoomWidgetState(updated.room, microLib) });
+      }
+
+      if (cmd === 'wm' && roomId && parts[2] && parts[3] !== undefined) {
+        const finishCode = parts[2];
+        const microIdx = parseInt(parts[3], 10);
+        const [room, microLib] = await Promise.all([
+          getRoomByIdOrCode(env, roomId),
+          fetchMicroTaskLibrary(env)
+        ]);
+        if (!room) return jsonResponse({ ok: false, error: 'Room not found' }, 404);
+        const micros = getRoomFinishMicroTasks(room, finishCode, microLib);
+        const targetMicro = micros[microIdx];
+        if (!targetMicro) return jsonResponse({ ok: false, error: 'Micro not found' }, 404);
+        const updated = await quickCycleRoomMicro(env, roomId, finishCode, targetMicro.id, authorName);
+        if (!updated) return jsonResponse({ ok: false, error: 'Micro update failed' }, 400);
+        await broadcastBotChangeNotification(env, {
+          source: 'telegram',
+          roomId: updated.room.id,
+          roomTitle: `L${updated.room.level} Z${updated.room.zone} · ${updated.room.spaceCode || updated.room.spaceNo || ''} — ${updated.room.space}`,
+          summary: `🔧 Prep "${updated.microName}" [${finishCode}] ➔ ${updated.nextStatus.toUpperCase()}`,
+          by: authorName,
+          excludeTelegramUserId: tgUserId
+        });
+        return jsonResponse({ ok: true, result: buildRoomWidgetState(updated.room, microLib) });
+      }
+
+      if (cmd === 'wa' && roomId && parts[2]) {
+        const finishCode = parts[2];
+        const [updated, microLib] = await Promise.all([
+          passAllRoomMicros(env, roomId, finishCode, authorName),
+          fetchMicroTaskLibrary(env)
+        ]);
+        if (!updated) return jsonResponse({ ok: false, error: 'Pass all failed' }, 400);
+        await broadcastBotChangeNotification(env, {
+          source: 'telegram',
+          roomId: updated.room.id,
+          roomTitle: `L${updated.room.level} Z${updated.room.zone} · ${updated.room.spaceCode || updated.room.spaceNo || ''} — ${updated.room.space}`,
+          summary: `✅ All ${updated.count} prep steps for ${finishCode} marked DONE`,
+          by: authorName,
+          excludeTelegramUserId: tgUserId
+        });
+        return jsonResponse({ ok: true, result: buildRoomWidgetState(updated.room, microLib) });
+      }
+
+      if (cmd === 'ws' && roomId && parts[2]) {
+        const [res, microLib] = await Promise.all([
+          closeRoomSnag(env, roomId, parts[2], authorName),
+          fetchMicroTaskLibrary(env)
+        ]);
+        if (!res) return jsonResponse({ ok: false, error: 'Resolve snag failed' }, 400);
+        await broadcastBotChangeNotification(env, {
+          source: 'telegram',
+          roomId: res.room.id,
+          roomTitle: `L${res.room.level} Z${res.room.zone} · ${res.room.spaceCode || res.room.spaceNo || ''} — ${res.room.space}`,
+          summary: `✅ Snag resolved`,
+          by: authorName,
+          excludeTelegramUserId: tgUserId
+        });
+        return jsonResponse({ ok: true, result: buildRoomWidgetState(res.room, microLib) });
+      }
+
+      return jsonResponse({ ok: false, error: `Unknown widget query: ${data}` }, 400);
+    } catch (e: any) {
+      return jsonResponse({ ok: false, error: e?.message || 'Widget query error' }, 500);
+    }
+  }
+
+  const roomCode = (url.searchParams.get('room') || 'F1-021').trim();
+  const widgetType = (url.searchParams.get('type') || 'room').toLowerCase();
+  const mode = (url.searchParams.get('mode') || 'json').toLowerCase();
+  const shouldSend = url.searchParams.get('send') === '1';
+
+  const [room, microLib, stats, reg] = await Promise.all([
+    getRoomByIdOrCode(env, roomCode),
+    fetchMicroTaskLibrary(env),
+    getProjectStats(env),
+    getTelegramAuthRegistry(env)
+  ]);
+
+  const isStats = widgetType === 'stats' || !room;
+  const widgetHtml = isStats ? STATS_WIDGET_HTML : ROOM_WIDGET_HTML;
+  const stateJson = isStats
+    ? buildStatsWidgetState(stats)
+    : buildRoomWidgetState(room!, microLib);
+
+  let telegramApiResult: any = null;
+  if (shouldSend && env.TELEGRAM_BOT_TOKEN) {
+    const approvedUsers = Object.values(reg.users).filter(u => u.status === 'approved' && u.chatId);
+    const targetChatId = url.searchParams.get('chatId') || approvedUsers[0]?.chatId;
+    if (targetChatId) {
+      const card = isStats ? await buildStatsCard(env) : buildRoomDashboardCard(room!, microLib);
+      const caption = card.text.length > 980 ? card.text.slice(0, 975) + '…' : card.text;
+      telegramApiResult = await sendWidget(env.TELEGRAM_BOT_TOKEN, targetChatId, widgetHtml, {
+        caption,
+        public_data: stateJson,
+        chat_data: stateJson,
+        allow_queries: true,
+        reply_markup: card.keyboard
+      });
+    } else {
+      telegramApiResult = { ok: false, error: 'No approved Telegram chatId found in registry' };
+    }
+  }
+
+  if (mode === 'html' || mode === 'preview') {
+    const escapedState = stateJson.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+    const simulatorPage = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ECIT Telegram Widget Simulator</title>
+<style>
+  :root {
+    --tg-theme-bg-color: #18222d;
+    --tg-theme-secondary-bg-color: #131a22;
+    --tg-theme-text-color: #ffffff;
+    --tg-theme-hint-color: #7d8b99;
+    --tg-theme-link-color: #6ab3f3;
+    --tg-theme-button-color: #2ea6ff;
+    --tg-theme-button-text-color: #ffffff;
+    --tg-theme-section-separator-color: #293644;
+  }
+  body.light {
+    --tg-theme-bg-color: #ffffff;
+    --tg-theme-secondary-bg-color: #f1f4f8;
+    --tg-theme-text-color: #111827;
+    --tg-theme-hint-color: #6b7280;
+    --tg-theme-link-color: #0284c7;
+    --tg-theme-button-color: #0284c7;
+    --tg-theme-button-text-color: #ffffff;
+    --tg-theme-section-separator-color: #e5e7eb;
+  }
+  body {
+    margin: 0;
+    padding: 20px;
+    background: #0b1016;
+    color: #e2e8f0;
+    font-family: system-ui, -apple-system, sans-serif;
+  }
+  .toolbar {
+    max-width: 440px;
+    margin: 0 auto 14px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: center;
+    justify-content: space-between;
+    background: #161f2c;
+    padding: 10px 12px;
+    border-radius: 12px;
+    border: 1px solid #263447;
+  }
+  .toolbar a, .toolbar button {
+    padding: 6px 10px;
+    border-radius: 8px;
+    font-size: 12px;
+    font-weight: 600;
+    text-decoration: none;
+    border: 1px solid #334155;
+    background: #1e293b;
+    color: #f8fafc;
+    cursor: pointer;
+  }
+  .toolbar a.active {
+    background: #0284c7;
+    border-color: #38bdf8;
+  }
+  .bubble {
+    max-width: 440px;
+    margin: 0 auto;
+    background: var(--tg-theme-bg-color);
+    border-radius: 16px;
+    overflow: hidden;
+    box-shadow: 0 12px 32px rgba(0,0,0,0.45);
+    border: 1px solid rgba(255,255,255,0.08);
+  }
+  .log {
+    max-width: 440px;
+    margin: 14px auto 0;
+    background: #111822;
+    border: 1px solid #233044;
+    border-radius: 10px;
+    padding: 10px 12px;
+    font-family: ui-monospace, monospace;
+    font-size: 11px;
+    color: #94a3b8;
+    white-space: pre-wrap;
+    word-break: break-all;
+  }
+</style>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<script>
+  const listeners = {};
+  const tgWebApp = window.Telegram && window.Telegram.WebApp;
+  const isInsideTelegram = Boolean(tgWebApp && tgWebApp.initData);
+  window.TelegramWidget = {
+    chatData: '${escapedState}',
+    publicData: '${escapedState}',
+    colorScheme: (tgWebApp && tgWebApp.colorScheme) || 'dark',
+    onEvent(ev, fn) {
+      listeners[ev] = listeners[ev] || [];
+      listeners[ev].push(fn);
+    },
+    ready() {
+      if (isInsideTelegram) {
+        try { tgWebApp.ready(); tgWebApp.expand(); } catch {}
+      }
+    },
+    copyText(txt) {
+      navigator.clipboard?.writeText(txt);
+    },
+    HapticFeedback: {
+      impactOccurred(style) {
+        try { tgWebApp?.HapticFeedback?.impactOccurred?.(style || 'light'); } catch {}
+      },
+      notificationOccurred(type) {
+        try { tgWebApp?.HapticFeedback?.notificationOccurred?.(type || 'success'); } catch {}
+      }
+    },
+    async request(query) {
+      const logEl = document.getElementById('simLog');
+      if (logEl) logEl.textContent = '→ Sending widget_query: ' + query + ' ...';
+      const res = await fetch('/api/test-widget', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          query,
+          initData: isInsideTelegram ? tgWebApp.initData : ''
+        })
+      });
+      const json = await res.json();
+      if (json.ok && json.result) {
+        window.TelegramWidget.chatData = json.result;
+        window.TelegramWidget.publicData = json.result;
+        (listeners['chatDataChanged'] || []).forEach(fn => fn());
+        if (logEl) logEl.textContent = '✓ widget_query "' + query + '" answered (' + json.result.length + ' bytes):\\n' + json.result;
+        return { result: json.result };
+      }
+      throw { code: json.error || 'FAILED' };
+    }
+  };
+</script>
+</head>
+<body>
+  <div class="toolbar" id="simToolbar">
+    <div style="display:flex;gap:6px;align-items:center">
+      <a href="/api/test-widget?mode=preview&type=room&room=${encodeURIComponent(roomCode)}" class="${!isStats ? 'active' : ''}">🏠 Room (${roomCode})</a>
+      <a href="/api/test-widget?mode=preview&type=stats" class="${isStats ? 'active' : ''}">📊 Live KPIs</a>
+    </div>
+    <div style="display:flex;gap:6px">
+      <button onclick="document.body.classList.toggle('light')">🌗 Theme</button>
+      <button onclick="sendRealWidget()">📲 Test sendWidget API</button>
+    </div>
+  </div>
+  <div class="bubble">
+    ${widgetHtml}
+  </div>
+  <div class="log" id="simLog">Widget State (${new TextEncoder().encode(stateJson).length} / 1024 bytes):\n${stateJson}</div>
+  <script>
+    if (isInsideTelegram) {
+      document.getElementById('simToolbar').style.display = 'none';
+      document.getElementById('simLog').style.display = 'none';
+      document.body.style.padding = '8px';
+      if (tgWebApp.colorScheme === 'light') document.body.classList.add('light');
+    }
+    async function sendRealWidget() {
+      const logEl = document.getElementById('simLog');
+      logEl.textContent = 'Calling Telegram Bot API sendWidget...';
+      const r = await fetch('/api/test-widget?type=${isStats ? 'stats' : 'room'}&room=${encodeURIComponent(roomCode)}&send=1');
+      const d = await r.json();
+      logEl.textContent = 'Telegram Bot API sendWidget response:\\n' + JSON.stringify(d.telegramApiResult, null, 2);
+    }
+  </script>
+</body>
+</html>`;
+    return new Response(simulatorPage, {
+      status: 200,
+      headers: { 'Content-Type': 'text/html; charset=utf-8', ...CORS_HEADERS }
+    });
+  }
+
+  return jsonResponse({
+    ok: true,
+    widgetType: isStats ? 'stats' : 'room',
+    roomCode: room?.spaceCode || roomCode,
+    htmlBytes: new TextEncoder().encode(widgetHtml).length,
+    stateBytes: new TextEncoder().encode(stateJson).length,
+    stateLimitBytes: 1024,
+    stateJson: JSON.parse(stateJson),
+    previewUrl: `${url.origin}/api/test-widget?mode=preview&type=${isStats ? 'stats' : 'room'}&room=${encodeURIComponent(roomCode)}`,
+    telegramApiResult
+  });
 }
