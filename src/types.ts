@@ -55,16 +55,32 @@ export interface TelegramCallbackQuery {
   data?: string;
 }
 
+export interface TelegramWidgetQuery {
+  id: string;
+  from: TelegramUser;
+  chat?: TelegramChat;
+  message_id?: number;
+  inline_message_id?: string;
+  chat_instance?: string;
+  chat_type?: string;
+  widget_id?: string;
+  data?: string;
+}
+
 export interface TelegramUpdate {
   update_id: number;
   message?: TelegramMessage;
   callback_query?: TelegramCallbackQuery;
+  widget_query?: TelegramWidgetQuery;
+  shared_widget_query?: TelegramWidgetQuery;
 }
 
 export interface TelegramInlineKeyboardButton {
   text: string;
   callback_data?: string;
   url?: string;
+  copy_text?: { text: string };
+  web_app?: { url: string };
 }
 
 export interface TelegramInlineKeyboardMarkup {

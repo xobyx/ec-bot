@@ -143,6 +143,101 @@ export async function answerCallbackQuery(
   });
 }
 
+export async function sendWidget(
+  botToken: string,
+  chatId: number | string,
+  html: string,
+  options: {
+    caption?: string;
+    parse_mode?: 'Markdown' | 'HTML';
+    public_data?: string;
+    chat_data?: string;
+    allow_queries?: boolean;
+    is_shared?: boolean;
+    width?: number;
+    height?: number;
+    show_caption_above_media?: boolean;
+    reply_markup?: TelegramInlineKeyboardMarkup;
+  } = {}
+): Promise<any> {
+  const url = `${TELEGRAM_API_BASE}/bot${botToken}/sendWidget`;
+  const payload: Record<string, any> = {
+    chat_id: chatId,
+    html,
+    allow_queries: options.allow_queries ?? true
+  };
+  if (options.caption) {
+    payload.caption = options.caption;
+    payload.parse_mode = options.parse_mode ?? 'Markdown';
+  }
+  if (options.public_data !== undefined) payload.public_data = options.public_data;
+  if (options.chat_data !== undefined) payload.chat_data = options.chat_data;
+  if (options.is_shared !== undefined) payload.is_shared = options.is_shared;
+  if (options.width !== undefined) payload.width = options.width;
+  if (options.height !== undefined) payload.height = options.height;
+  if (options.show_caption_above_media !== undefined) {
+    payload.show_caption_above_media = options.show_caption_above_media;
+  }
+  if (options.reply_markup) payload.reply_markup = options.reply_markup;
+
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+  const data: any = await res.json();
+  if (!data.ok && payload.caption && payload.parse_mode) {
+    delete payload.parse_mode;
+    payload.caption = String(payload.caption).replace(/[*_`]/g, '');
+    const retryRes = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    return await retryRes.json();
+  }
+  return data;
+}
+
+export async function editMessageWidgetData(
+  botToken: string,
+  params: {
+    chat_id?: number | string;
+    message_id?: number;
+    inline_message_id?: string;
+    public_data?: string;
+    chat_data?: string;
+  }
+): Promise<any> {
+  const url = `${TELEGRAM_API_BASE}/bot${botToken}/editMessageWidgetData`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(params)
+  });
+  return await res.json();
+}
+
+export async function answerWidgetQuery(
+  botToken: string,
+  widgetQueryId: string,
+  data?: string
+): Promise<any> {
+  const url = `${TELEGRAM_API_BASE}/bot${botToken}/answerWidgetQuery`;
+  const body: Record<string, any> = {
+    widget_query_id: widgetQueryId
+  };
+  if (data !== undefined) {
+    body.data = data.slice(0, 1024);
+  }
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+  return await res.json();
+}
+
 export async function deleteMessage(
   botToken: string,
   chatId: number | string,
@@ -169,7 +264,8 @@ export async function setMyCommands(botToken: string): Promise<any> {
   const url = `${TELEGRAM_API_BASE}/bot${botToken}/setMyCommands`;
   const commands = [
     { command: 'browse', description: '🧭 Browse levels, zones & rooms interactively' },
-    { command: 'status', description: '📊 Live project progress & KPI summary' },
+    { command: 'status', description: '📊 Live project progress & KPI widget' },
+    { command: 'widget', description: '🧩 Open interactive HTML widget (KPIs or /widget F1-021)' },
     { command: 'snags', description: '⚠️ View & resolve open snags across site' },
     { command: 'room', description: '🚪 Inspect a room by code (e.g. /room F1-021)' },
     { command: 'photos', description: '🖼️ View stored photos for a room' },

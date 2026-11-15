@@ -1,6 +1,7 @@
 import type {
   Env,
   TelegramUpdate,
+  TelegramWidgetQuery,
   PendingAction,
   TelegramInlineKeyboardButton,
   TelegramInlineKeyboardMarkup,
@@ -14,11 +15,20 @@ import {
   editMessageText,
   sendPhoto,
   answerCallbackQuery,
+  sendWidget,
+  editMessageWidgetData,
+  answerWidgetQuery,
   deleteMessage,
   setMyCommands,
   getFile,
   downloadTelegramFile
 } from './telegram';
+import {
+  ROOM_WIDGET_HTML,
+  STATS_WIDGET_HTML,
+  buildRoomWidgetState,
+  buildStatsWidgetState
+} from './widgets';
 import { analyzeSiteUpdate, normalizeScheduleCodeInput } from './ai';
 import {
   savePendingAction,
@@ -111,7 +121,15 @@ export default {
       }
       const webhookUrl = `${url.origin}/webhook`;
       const tgRes = await fetch(
-        `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/setWebhook?url=${encodeURIComponent(webhookUrl)}`
+        `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/setWebhook`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            url: webhookUrl,
+            allowed_updates: ['message', 'callback_query', 'widget_query', 'shared_widget_query']
+          })
+        }
       );
       const tgData: any = await tgRes.json();
       const cmdData = await setMyCommands(env.TELEGRAM_BOT_TOKEN).catch(e => ({ error: String(e) }));
@@ -690,6 +708,11 @@ async function handleTelegramUpdate(update: TelegramUpdate, env: Env): Promise<v
     return;
   }
 
+  if (update.widget_query || update.shared_widget_query) {
+    await handleWidgetQuery((update.widget_query || update.shared_widget_query)!, env);
+    return;
+  }
+
   if (update.callback_query) {
     await handleCallbackQuery(update.callback_query, env);
     return;
@@ -698,6 +721,246 @@ async function handleTelegramUpdate(update: TelegramUpdate, env: Env): Promise<v
   if (update.message) {
     await handleMessage(update.message, env);
     return;
+  }
+}
+
+async function sendRoomWidgetOrFallback(
+  env: Env,
+  chatId: number | string,
+  room: Room,
+  microLib: MicroTaskLibrary
+): Promise<void> {
+  const token = env.TELEGRAM_BOT_TOKEN;
+  const card = buildRoomDashboardCard(room, microLib);
+  const stateJson = buildRoomWidgetState(room, microLib);
+  const caption =
+    card.text.length > 980 ? card.text.slice(0, 975) + '…' : card.text;
+
+  try {
+    const res = await sendWidget(token, chatId, ROOM_WIDGET_HTML, {
+      caption,
+      public_data: stateJson,
+      chat_data: stateJson,
+      allow_queries: true,
+      reply_markup: card.keyboard
+    });
+    if (res && res.ok) return;
+  } catch (e) {
+    console.warn('sendWidget room fallback:', e);
+  }
+  await sendMessage(token, chatId, card.text, { reply_markup: card.keyboard });
+}
+
+async function sendStatsWidgetOrFallback(
+  env: Env,
+  chatId: number | string
+): Promise<void> {
+  const token = env.TELEGRAM_BOT_TOKEN;
+  const [stats, card] = await Promise.all([
+    getProjectStats(env),
+    buildStatsCard(env)
+  ]);
+  const stateJson = buildStatsWidgetState(stats);
+  const caption =
+    card.text.length > 980 ? card.text.slice(0, 975) + '…' : card.text;
+
+  try {
+    const res = await sendWidget(token, chatId, STATS_WIDGET_HTML, {
+      caption,
+      public_data: stateJson,
+      chat_data: stateJson,
+      allow_queries: true,
+      reply_markup: card.keyboard
+    });
+    if (res && res.ok) return;
+  } catch (e) {
+    console.warn('sendWidget stats fallback:', e);
+  }
+  await sendMessage(token, chatId, card.text, { reply_markup: card.keyboard });
+}
+
+async function handleWidgetQuery(
+  wQuery: TelegramWidgetQuery,
+  env: Env
+): Promise<void> {
+  const token = env.TELEGRAM_BOT_TOKEN;
+  const tgFrom = wQuery.from;
+  const tgUserId = Number(tgFrom?.id || 0);
+  const data = String(wQuery.data || '').trim();
+
+  const authUser = await getAuthorizedTelegramUser(env, tgUserId);
+  if (!authUser || authUser.status !== 'approved') {
+    await answerWidgetQuery(token, wQuery.id, '');
+    return;
+  }
+
+  const authorName = formatTelegramAuthorLabel(authUser, tgFrom);
+
+  const pushStateToWidgetMessage = async (stateJson: string) => {
+    try {
+      if (wQuery.chat?.id && wQuery.message_id) {
+        await editMessageWidgetData(token, {
+          chat_id: wQuery.chat.id,
+          message_id: wQuery.message_id,
+          chat_data: stateJson,
+          public_data: stateJson
+        });
+      } else if (wQuery.inline_message_id) {
+        await editMessageWidgetData(token, {
+          inline_message_id: wQuery.inline_message_id,
+          chat_data: stateJson,
+          public_data: stateJson
+        });
+      }
+    } catch {}
+  };
+
+  try {
+    if (data === 'wstat:refresh') {
+      const stats = await getProjectStats(env);
+      const stateJson = buildStatsWidgetState(stats);
+      await answerWidgetQuery(token, wQuery.id, stateJson);
+      await pushStateToWidgetMessage(stateJson);
+      return;
+    }
+
+    const parts = data.split(':');
+    const cmd = parts[0];
+    const roomId = parts[1] || '';
+
+    if (cmd === 'wr' && roomId) {
+      const [room, microLib] = await Promise.all([
+        getRoomByIdOrCode(env, roomId),
+        fetchMicroTaskLibrary(env)
+      ]);
+      if (!room) {
+        await answerWidgetQuery(token, wQuery.id, '');
+        return;
+      }
+      const stateJson = buildRoomWidgetState(room, microLib);
+      await answerWidgetQuery(token, wQuery.id, stateJson);
+      await pushStateToWidgetMessage(stateJson);
+      return;
+    }
+
+    if (cmd === 'wf' && roomId && parts[2]) {
+      const finishCode = parts[2];
+      const [updated, microLib] = await Promise.all([
+        quickCycleRoomFinish(env, roomId, finishCode, authorName),
+        fetchMicroTaskLibrary(env)
+      ]);
+      if (!updated) {
+        await answerWidgetQuery(token, wQuery.id, '');
+        return;
+      }
+      const stateJson = buildRoomWidgetState(updated.room, microLib);
+      await answerWidgetQuery(token, wQuery.id, stateJson);
+      await pushStateToWidgetMessage(stateJson);
+      await broadcastBotChangeNotification(env, {
+        source: 'telegram',
+        roomId: updated.room.id,
+        roomTitle: `L${updated.room.level} Z${updated.room.zone} · ${updated.room.spaceCode || updated.room.spaceNo || ''} — ${updated.room.space}`,
+        summary: `${finishCode} (${finishCompactName(finishCode)}) ➔ ${updated.nextStatus.toUpperCase()}`,
+        by: authorName,
+        excludeTelegramUserId: tgUserId
+      });
+      return;
+    }
+
+    if (cmd === 'wm' && roomId && parts[2] && parts[3] !== undefined) {
+      const finishCode = parts[2];
+      const microIdx = parseInt(parts[3], 10);
+      const [room, microLib] = await Promise.all([
+        getRoomByIdOrCode(env, roomId),
+        fetchMicroTaskLibrary(env)
+      ]);
+      if (!room) {
+        await answerWidgetQuery(token, wQuery.id, '');
+        return;
+      }
+      const micros = getRoomFinishMicroTasks(room, finishCode, microLib);
+      const targetMicro = micros[microIdx];
+      if (!targetMicro) {
+        await answerWidgetQuery(token, wQuery.id, '');
+        return;
+      }
+      const updated = await quickCycleRoomMicro(
+        env,
+        roomId,
+        finishCode,
+        targetMicro.id,
+        authorName
+      );
+      if (!updated) {
+        await answerWidgetQuery(token, wQuery.id, '');
+        return;
+      }
+      const stateJson = buildRoomWidgetState(updated.room, microLib);
+      await answerWidgetQuery(token, wQuery.id, stateJson);
+      await pushStateToWidgetMessage(stateJson);
+      await broadcastBotChangeNotification(env, {
+        source: 'telegram',
+        roomId: updated.room.id,
+        roomTitle: `L${updated.room.level} Z${updated.room.zone} · ${updated.room.spaceCode || updated.room.spaceNo || ''} — ${updated.room.space}`,
+        summary: `🔧 Prep "${updated.microName}" [${finishCode}] ➔ ${updated.nextStatus.toUpperCase()}`,
+        by: authorName,
+        excludeTelegramUserId: tgUserId
+      });
+      return;
+    }
+
+    if (cmd === 'wa' && roomId && parts[2]) {
+      const finishCode = parts[2];
+      const [updated, microLib] = await Promise.all([
+        passAllRoomMicros(env, roomId, finishCode, authorName),
+        fetchMicroTaskLibrary(env)
+      ]);
+      if (!updated) {
+        await answerWidgetQuery(token, wQuery.id, '');
+        return;
+      }
+      const stateJson = buildRoomWidgetState(updated.room, microLib);
+      await answerWidgetQuery(token, wQuery.id, stateJson);
+      await pushStateToWidgetMessage(stateJson);
+      await broadcastBotChangeNotification(env, {
+        source: 'telegram',
+        roomId: updated.room.id,
+        roomTitle: `L${updated.room.level} Z${updated.room.zone} · ${updated.room.spaceCode || updated.room.spaceNo || ''} — ${updated.room.space}`,
+        summary: `✅ All ${updated.count} prep steps for ${finishCode} marked DONE`,
+        by: authorName,
+        excludeTelegramUserId: tgUserId
+      });
+      return;
+    }
+
+    if (cmd === 'ws' && roomId && parts[2]) {
+      const snagId = parts[2];
+      const [res, microLib] = await Promise.all([
+        closeRoomSnag(env, roomId, snagId, authorName),
+        fetchMicroTaskLibrary(env)
+      ]);
+      if (!res) {
+        await answerWidgetQuery(token, wQuery.id, '');
+        return;
+      }
+      const stateJson = buildRoomWidgetState(res.room, microLib);
+      await answerWidgetQuery(token, wQuery.id, stateJson);
+      await pushStateToWidgetMessage(stateJson);
+      await broadcastBotChangeNotification(env, {
+        source: 'telegram',
+        roomId: res.room.id,
+        roomTitle: `L${res.room.level} Z${res.room.zone} · ${res.room.spaceCode || res.room.spaceNo || ''} — ${res.room.space}`,
+        summary: `✅ Snag resolved`,
+        by: authorName,
+        excludeTelegramUserId: tgUserId
+      });
+      return;
+    }
+
+    await answerWidgetQuery(token, wQuery.id, '');
+  } catch (err) {
+    console.error('handleWidgetQuery error:', err);
+    await answerWidgetQuery(token, wQuery.id, '').catch(() => {});
   }
 }
 
@@ -967,9 +1230,10 @@ async function handleMessage(message: any, env: Env): Promise<void> {
       `• Or send a *Photo* (even without room/level — interactive buttons will guide you!)\n\n` +
       `*Quick Commands:*\n` +
       `• \`/browse\` — Browse Levels ➔ Zones ➔ Rooms interactively\n` +
-      `• \`/status\` — Live project KPIs & floor progress\n` +
+      `• \`/status\` — Live project KPIs & interactive floor widget\n` +
+      `• \`/widget [code]\` — Open interactive HTML widget (\`/widget F1-021\`)\n` +
       `• \`/snags\` — View & resolve open snags across the site\n` +
-      `• \`/room <code>\` — Open interactive room dashboard\n` +
+      `• \`/room <code>\` — Open interactive room dashboard & widget\n` +
       `• \`/photos <code>\` — View stored room photos\n` +
       `• \`/notify\` — Toggle live site & bot change notifications\n` +
       `• \`/whoami\` — View linked account & role`;
@@ -992,8 +1256,29 @@ async function handleMessage(message: any, env: Env): Promise<void> {
 
   // Command: /status or /stats
   if (text.startsWith('/status') || text.startsWith('/stats')) {
-    const card = await buildStatsCard(env);
-    await sendMessage(token, chatId, card.text, { reply_markup: card.keyboard });
+    await sendStatsWidgetOrFallback(env, chatId);
+    return;
+  }
+
+  // Command: /widget [room_code]
+  if (text.startsWith('/widget')) {
+    const arg = text.replace(/^\/widget(?:@\w+)?\s*/i, '').trim();
+    if (!arg) {
+      await sendStatsWidgetOrFallback(env, chatId);
+      return;
+    }
+    const room = await getRoomByIdOrCode(env, arg);
+    if (!room) {
+      await sendMessage(
+        token,
+        chatId,
+        `⚠️ Room \`${arg}\` not found. Tap below to browse by Level & Zone:`,
+        { reply_markup: buildBrowseLevelsCard().keyboard }
+      );
+      return;
+    }
+    const microLib = await fetchMicroTaskLibrary(env);
+    await sendRoomWidgetOrFallback(env, chatId, room, microLib);
     return;
   }
 
@@ -1034,8 +1319,7 @@ async function handleMessage(message: any, env: Env): Promise<void> {
       await sendRoomInspectionAndPhotos(env, chatId, room, true);
     } else {
       const microLib = await fetchMicroTaskLibrary(env);
-      const card = buildRoomDashboardCard(room, microLib);
-      await sendMessage(token, chatId, card.text, { reply_markup: card.keyboard });
+      await sendRoomWidgetOrFallback(env, chatId, room, microLib);
     }
     return;
   }
@@ -1327,8 +1611,13 @@ function buildRoomDashboardCard(
     ]);
   }
 
-  // Photos & Web App link row
-  const actionRow: TelegramInlineKeyboardButton[] = [];
+  // Photos, Live Widget & Web App link row
+  const actionRow: TelegramInlineKeyboardButton[] = [
+    {
+      text: '🧩 Live Widget',
+      callback_data: `b_wrm:${room.id}`
+    }
+  ];
   if ((room.photos || []).length > 0) {
     actionRow.push({
       text: `🖼️ Photos (${room.photos.length})`,
@@ -1336,7 +1625,7 @@ function buildRoomDashboardCard(
     });
   }
   actionRow.push({
-    text: '🌐 Open in Web App',
+    text: '🌐 Web App',
     url: `${WEB_APP_BASE}/#/room/${encodeURIComponent(room.id)}`
   });
   rows.push(actionRow);
@@ -1453,8 +1742,9 @@ async function buildStatsCard(env: Env): Promise<{ text: string; keyboard: Teleg
         row1,
         row2,
         [
+          { text: '🧩 Live KPI Widget', callback_data: 'b_wstat:0' },
           { text: '🔄 Refresh Stats', callback_data: 'b_stats:refresh' },
-          { text: `⚠️ Open Snags (${stats.openSnags})`, callback_data: 'b_snags:0' }
+          { text: `⚠️ Snags (${stats.openSnags})`, callback_data: 'b_snags:0' }
         ]
       ]
     }
@@ -2192,6 +2482,27 @@ async function handleCallbackQuery(query: any, env: Env): Promise<void> {
     if (room && chatId && messageId) {
       const card = buildRoomDashboardCard(room, microLib);
       await editMessageText(token, chatId, messageId, card.text, { reply_markup: card.keyboard });
+    }
+    return;
+  }
+
+  if (actionType === 'b_wrm') {
+    const roomId = parts.slice(1).join(':');
+    await answerCallbackQuery(token, query.id, 'Opening interactive room widget...');
+    const [room, microLib] = await Promise.all([
+      getRoomByIdOrCode(env, roomId),
+      fetchMicroTaskLibrary(env)
+    ]);
+    if (room && chatId) {
+      await sendRoomWidgetOrFallback(env, chatId, room, microLib);
+    }
+    return;
+  }
+
+  if (actionType === 'b_wstat') {
+    await answerCallbackQuery(token, query.id, 'Opening live KPI widget...');
+    if (chatId) {
+      await sendStatsWidgetOrFallback(env, chatId);
     }
     return;
   }
