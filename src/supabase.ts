@@ -392,9 +392,93 @@ export async function deleteSitePhoto(env: Env, photoId: string): Promise<void> 
 }
 
 export function getPhotoPublicUrl(env: Env, photoId: string): string {
+  const raw = String(photoId || '').trim();
+  if (!raw) return '';
+  if (/^https?:\/\//i.test(raw)) {
+    return raw;
+  }
   const sb = getSupabase(env);
   const bucket = env.SUPABASE_BUCKET || 'photos';
-  return sb.storage.from(bucket).getPublicUrl(`${photoId}.jpg`).data.publicUrl;
+  const hasExt = /\.(jpe?g|png|webp|gif)$/i.test(raw);
+  const filePath = hasExt ? raw : `${raw}.jpg`;
+  return sb.storage.from(bucket).getPublicUrl(filePath).data.publicUrl;
+}
+
+export interface MergedRoomPhotoItem {
+  id: string;
+  caption: string;
+  code?: string;
+  ts?: string;
+  isSnagPhoto: boolean;
+  snagId?: string;
+  snagTrade?: string;
+  snagStatus?: 'open' | 'closed';
+}
+
+export function getAllRoomPhotoItems(room: Room, snagPhotosOnly = false): MergedRoomPhotoItem[] {
+  const map = new Map<string, MergedRoomPhotoItem>();
+
+  // 1. Collect snag photos first so snag context (trade, snagId, defect text) is preserved
+  for (const sn of room.snags || []) {
+    if (!sn || !Array.isArray(sn.photos)) continue;
+    for (const rawPid of sn.photos) {
+      const pid = String(rawPid || '').trim();
+      if (!pid || map.has(pid)) continue;
+      map.set(pid, {
+        id: pid,
+        caption: sn.text || 'Snag defect photo',
+        code: sn.code || undefined,
+        ts: sn.created || undefined,
+        isSnagPhoto: true,
+        snagId: sn.id,
+        snagTrade: sn.trade || 'General',
+        snagStatus: sn.status || 'open'
+      });
+    }
+  }
+
+  if (snagPhotosOnly) {
+    // Also include any room.photos explicitly captioned with "Snag:" if not already in map
+    for (const p of room.photos || []) {
+      if (!p?.id) continue;
+      const pid = String(p.id).trim();
+      if (!pid || map.has(pid) || /^photo_\d+_/i.test(pid)) continue;
+      if (/^snag:/i.test(p.caption || '')) {
+        map.set(pid, {
+          id: pid,
+          caption: p.caption || 'Snag photo',
+          code: p.code || undefined,
+          ts: p.ts || undefined,
+          isSnagPhoto: true
+        });
+      }
+    }
+    return Array.from(map.values());
+  }
+
+  // 2. Collect general room photos (skip legacy non-existent `photo_<ts>_` placeholders)
+  for (const p of room.photos || []) {
+    if (!p || !p.id) continue;
+    const pid = String(p.id).trim();
+    if (!pid || /^photo_\d+_/i.test(pid)) continue;
+    const existing = map.get(pid);
+    if (existing) {
+      if (!existing.caption && p.caption) existing.caption = p.caption;
+      if (!existing.code && p.code) existing.code = p.code;
+      if (!existing.ts && p.ts) existing.ts = p.ts;
+    } else {
+      const isCaptionSnag = /^snag:/i.test(p.caption || '');
+      map.set(pid, {
+        id: pid,
+        caption: p.caption || 'Site photo',
+        code: p.code || undefined,
+        ts: p.ts || undefined,
+        isSnagPhoto: isCaptionSnag
+      });
+    }
+  }
+
+  return Array.from(map.values());
 }
 
 export async function getRoomByIdOrCode(env: Env, idOrCode: string): Promise<Room | null> {
@@ -1264,7 +1348,18 @@ export async function getProjectStats(env: Env) {
     byLevel[lvl].snags += rOpen;
 
     const rPhotos = Array.isArray(r.photos) ? r.photos : [];
-    totalPhotos += rPhotos.length;
+    const uniquePhotoIds = new Set<string>();
+    for (const p of rPhotos) {
+      if (p?.id) uniquePhotoIds.add(String(p.id));
+    }
+    for (const s of rSnags) {
+      if (Array.isArray(s?.photos)) {
+        for (const pid of s.photos) {
+          if (pid) uniquePhotoIds.add(String(pid));
+        }
+      }
+    }
+    totalPhotos += uniquePhotoIds.size;
   }
 
   return {

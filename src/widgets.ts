@@ -1,5 +1,5 @@
 import type { Room, MicroTaskLibrary, Status } from './types';
-import { finishCompactName, getRoomFinishMicroTasks } from './supabase';
+import { finishCompactName, getRoomFinishMicroTasks, getAllRoomPhotoItems } from './supabase';
 
 function statusShortCode(st: Status | string | undefined): 'd' | 'o' | 'p' {
   if (st === 'done') return 'd';
@@ -52,7 +52,8 @@ export function buildRoomWidgetState(room: Room, microLib: MicroTaskLibrary): st
     const s = openSnags.slice(0, maxSnags).map(sn => [
       sn.id,
       (sn.trade || 'Gen').slice(0, 10),
-      (sn.text || 'Snag').slice(0, 36)
+      (sn.text || 'Snag').slice(0, 36),
+      (sn.photos && sn.photos[0]) || ''
     ]);
 
     return JSON.stringify({
@@ -61,7 +62,7 @@ export function buildRoomWidgetState(room: Room, microLib: MicroTaskLibrary): st
       n: (room.space || 'Room').slice(0, 28),
       l: room.level,
       z: room.zone || 0,
-      p: (room.photos || []).length,
+      p: getAllRoomPhotoItems(room).length,
       f,
       s
     });
@@ -247,7 +248,9 @@ function draw(){
   }else{
     sn.forEach(g=>{
       const r=document.createElement('div');r.className='row';
-      r.innerHTML='<div class="rn"><div class="rc">⚠️ '+g[1]+'</div><div class="rd">'+g[2]+'</div></div>';
+      const pUrl=g[3]?(g[3].indexOf('http')===0?g[3]:'https://ynrgbmssbilugflxtpfx.supabase.co/storage/v1/object/public/photos/'+g[3]+'.jpg'):'';
+      const imgHtml=pUrl?'<a href="'+pUrl+'" target="_blank"><img src="'+pUrl+'" style="width:42px;height:42px;object-fit:cover;border-radius:6px;display:block"></a>':'';
+      r.innerHTML=imgHtml+'<div class="rn"><div class="rc">⚠️ '+g[1]+(pUrl?' · 📸':'')+'</div><div class="rd">'+g[2]+'</div></div>';
       const b=document.createElement('button');
       b.className='st st-d';b.textContent='✓ Resolve';
       b.onclick=()=>req('ws:'+s.id+':'+g[0]);

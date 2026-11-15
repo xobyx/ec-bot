@@ -40,6 +40,7 @@ import {
   uploadSitePhoto,
   deleteSitePhoto,
   getPhotoPublicUrl,
+  getAllRoomPhotoItems,
   getRoomByIdOrCode,
   getRoomsForLevelZone,
   resolveRoomCandidates,
@@ -1412,8 +1413,7 @@ async function handleMessage(message: any, env: Env): Promise<void> {
     if (isPhotosOnly) {
       await sendRoomInspectionAndPhotos(env, chatId, room, true);
     } else {
-      const microLib = await fetchMicroTaskLibrary(env);
-      await sendRoomWidgetOrFallback(env, chatId, room, microLib);
+      await sendRoomInspectionAndPhotos(env, chatId, room, false);
     }
     return;
   }
@@ -1592,8 +1592,9 @@ async function buildBrowseRoomsListCard(
     const emoji = roomOverallEmoji(rm);
     const code = rm.spaceCode || rm.spaceNo || '';
     const openSnags = (rm.snags || []).filter(s => s.status === 'open').length;
+    const allPhotosCount = getAllRoomPhotoItems(rm).length;
     const snagBadge = openSnags > 0 ? ` ⚠️${openSnags}` : '';
-    const photoBadge = (rm.photos || []).length > 0 ? ` 📸${rm.photos.length}` : '';
+    const photoBadge = allPhotosCount > 0 ? ` 📸${allPhotosCount}` : '';
     const label = `${emoji} ${code ? code + ' · ' : ''}${rm.space}${snagBadge}${photoBadge}`;
     return [
       {
@@ -1652,9 +1653,16 @@ function buildRoomDashboardCard(
   const snagLines = openSnags.length
     ? openSnags
         .slice(0, 5)
-        .map((s, i) => `  ${i + 1}. ⚠️ *[${s.trade || 'General'}]* ${s.text}`)
+        .map((s, i) => {
+          const sPhCount = Array.isArray(s.photos) ? s.photos.filter(Boolean).length : 0;
+          const phTag = sPhCount > 0 ? ` _(📸 ${sPhCount})_` : '';
+          return `  ${i + 1}. ⚠️ *[${s.trade || 'General'}]* ${s.text}${phTag}`;
+        })
         .join('\n')
     : '  ✅ None';
+
+  const allPhotos = getAllRoomPhotoItems(room, false);
+  const snagPhotos = getAllRoomPhotoItems(room, true);
 
   const latestLogs = (room.log || []).slice(0, 2);
   const logLines = latestLogs.length
@@ -1666,7 +1674,7 @@ function buildRoomDashboardCard(
     `📋 *Finishes (${checkEntries.filter(([, s]) => s === 'done').length}/${checkEntries.length} Done):*\n${checksLines}\n\n` +
     `⚠️ *Open Snags (${openSnags.length}):*\n${snagLines}\n` +
     (room.notes ? `\n📝 *Notes:* _${room.notes}_\n` : '') +
-    `📸 *Stored Photos:* ${(room.photos || []).length}` +
+    `📸 *Stored Photos:* ${allPhotos.length}${snagPhotos.length > 0 ? ` _(${snagPhotos.length} snag photo${snagPhotos.length > 1 ? 's' : ''})_` : ''}` +
     (logLines ? `\n\n🕒 *Recent Activity:*\n${logLines}` : '') +
     `\n\n💡 _Tap any finish below to cycle status (Pending ➔ Ongoing ➔ Done), tap 🔧 Prep to manage micro-tasks, or reply with a photo/note!_`;
 
@@ -1707,15 +1715,31 @@ function buildRoomDashboardCard(
 
   // Photos, Live Widget & Web App link row
   const roomQueryParam = encodeURIComponent(room.spaceCode || room.spaceNo || room.id);
+  if (snagPhotos.length > 0) {
+    const photoRow: TelegramInlineKeyboardButton[] = [
+      {
+        text: `📸 Snag Photos (${snagPhotos.length})`,
+        callback_data: `vsnag:dash:${room.id}`
+      }
+    ];
+    if (allPhotos.length > snagPhotos.length) {
+      photoRow.push({
+        text: `🖼️ All Photos (${allPhotos.length})`,
+        callback_data: `vroom:dash:${room.id}`
+      });
+    }
+    rows.push(photoRow);
+  }
+
   const actionRow: TelegramInlineKeyboardButton[] = [
     {
       text: '🧩 Quick Widget',
       web_app: { url: `${WORKER_BASE}/api/test-widget?mode=preview&type=room&room=${roomQueryParam}` }
     }
   ];
-  if ((room.photos || []).length > 0) {
+  if (allPhotos.length > 0 && snagPhotos.length === 0) {
     actionRow.push({
-      text: `🖼️ Photos (${room.photos.length})`,
+      text: `🖼️ Photos (${allPhotos.length})`,
       callback_data: `vroom:dash:${room.id}`
     });
   }
@@ -1873,26 +1897,39 @@ async function buildOpenSnagsCard(
 
   const lines = slice.map(r => {
     const open = (r.snags || []).filter(s => s.status === 'open');
+    const snagPhCount = getAllRoomPhotoItems(r, true).length;
     const code = r.spaceCode || r.spaceNo || '';
     const sample = open[0]?.text || '';
-    return `• *${r.level === 0 ? 'GF' : 'L' + r.level} Z${r.zone || 'All'} ${code}* (${r.space}) — *${open.length} open*\n  _"${sample.slice(0, 60)}"_`;
+    const phTag = snagPhCount > 0 ? ` · 📸 *${snagPhCount} photo${snagPhCount > 1 ? 's' : ''}*` : '';
+    return `• *${r.level === 0 ? 'GF' : 'L' + r.level} Z${r.zone || 'All'} ${code}* (${r.space}) — *${open.length} open*${phTag}\n  _"${sample.slice(0, 60)}"_`;
   });
 
   const text =
     `⚠️ *Open Snags Across Site (${totalOpenSnags} total in ${rooms.length} rooms)*\n` +
     `Page ${safePage + 1} of ${totalPages}\n\n` +
     `${lines.join('\n\n')}\n\n` +
-    `👇 *Tap a room below to inspect or resolve its snags:*`;
+    `👇 *Tap a room below to inspect/resolve snags, or tap 📸 to view snag photos:*`;
 
   const rows: TelegramInlineKeyboardButton[][] = slice.map(r => {
     const openCount = (r.snags || []).filter(s => s.status === 'open').length;
+    const snagPhCount = getAllRoomPhotoItems(r, true).length;
     const code = r.spaceCode || r.spaceNo || '';
-    return [
+    const row: TelegramInlineKeyboardButton[] = [
       {
-        text: `⚠️ (${openCount}) ${r.level === 0 ? 'GF' : 'L' + r.level} ${code} · ${r.space}`.slice(0, 48),
+        text: `⚠️ (${openCount}) ${r.level === 0 ? 'GF' : 'L' + r.level} ${code} · ${r.space}`.slice(
+          0,
+          snagPhCount > 0 ? 34 : 48
+        ),
         callback_data: `b_rm:${r.id}`
       }
     ];
+    if (snagPhCount > 0) {
+      row.push({
+        text: `📸 Photos (${snagPhCount})`,
+        callback_data: `vsnag:list:${r.id}`
+      });
+    }
+    return row;
   });
 
   if (totalPages > 1) {
@@ -2779,10 +2816,20 @@ async function handleCallbackQuery(query: any, env: Env): Promise<void> {
 
   // View stored photos for a room directly from a completed card
   if (actionType === 'vroom') {
-    await answerCallbackQuery(token, query.id, 'Fetching room photos from storage...');
+    await answerCallbackQuery(token, query.id, 'Fetching room & snag photos from storage...');
     const room = await getRoomByIdOrCode(env, value);
     if (room && chatId) {
-      await sendRoomInspectionAndPhotos(env, chatId, room, true);
+      await sendRoomInspectionAndPhotos(env, chatId, room, true, false);
+    }
+    return;
+  }
+
+  // View snag photos for a room directly from /snags or room dashboard
+  if (actionType === 'vsnag') {
+    await answerCallbackQuery(token, query.id, 'Fetching snag photos from storage...');
+    const room = await getRoomByIdOrCode(env, value);
+    if (room && chatId) {
+      await sendRoomInspectionAndPhotos(env, chatId, room, true, true);
     }
     return;
   }
@@ -3102,7 +3149,8 @@ async function sendRoomInspectionAndPhotos(
   env: Env,
   chatId: number | string,
   room: Room,
-  photosOnly = false
+  photosOnly = false,
+  snagOnly = false
 ) {
   const token = env.TELEGRAM_BOT_TOKEN;
   const title = formatRoomTitle(room);
@@ -3113,16 +3161,56 @@ async function sendRoomInspectionAndPhotos(
     await sendMessage(token, chatId, card.text, { reply_markup: card.keyboard });
   }
 
-  const photos = (room.photos || []).slice(0, 5);
+  const allItems = getAllRoomPhotoItems(room, snagOnly);
+  const photos = allItems.slice(0, 8);
   if (!photos.length) {
-    await sendMessage(token, chatId, `📭 No stored photos found for *${title}*.`);
+    if (photosOnly) {
+      await sendMessage(
+        token,
+        chatId,
+        snagOnly
+          ? `📭 No snag photos found for *${title}*.`
+          : `📭 No stored photos found for *${title}*.`
+      );
+    }
     return;
   }
 
   for (const p of photos) {
     const publicUrl = getPhotoPublicUrl(env, p.id);
-    const caption = `📸 *${title}*\n${p.code ? `Finish: ${formatFinishLine(p.code)} · ` : ''}${p.caption || 'Site photo'}\nID: \`${p.id}\``;
-    await sendPhoto(token, chatId, publicUrl, caption);
+    if (!publicUrl) continue;
+
+    const kindHeader = p.isSnagPhoto
+      ? `⚠️ *Snag Photo${p.snagTrade ? ` [${p.snagTrade}]` : ''}*${p.snagStatus === 'closed' ? ' _(Resolved)_' : ''}\n`
+      : '';
+    const finishPart = p.code ? `Finish: ${formatFinishLine(p.code)}\n` : '';
+    const caption =
+      `📸 *${title}*\n` +
+      kindHeader +
+      finishPart +
+      `📝 ${p.caption || 'Site photo'}`;
+
+    const replyMarkup: TelegramInlineKeyboardMarkup | undefined =
+      p.isSnagPhoto && p.snagId && p.snagStatus === 'open'
+        ? {
+            inline_keyboard: [
+              [
+                {
+                  text: `✅ Resolve Snag`,
+                  callback_data: `qsnag:${room.id}:${p.snagId}`
+                },
+                {
+                  text: `🏠 Room Card`,
+                  callback_data: `b_rm:${room.id}`
+                }
+              ]
+            ]
+          }
+        : undefined;
+
+    await sendPhoto(token, chatId, publicUrl, caption, {
+      reply_markup: replyMarkup
+    });
   }
 }
 async function handleTestAiApi(request: Request, env: Env): Promise<Response> {
