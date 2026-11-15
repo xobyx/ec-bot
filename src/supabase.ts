@@ -1908,6 +1908,127 @@ export async function adminDeleteWebUser(env: Env, userId: string): Promise<void
   await unlinkTelegramUser(env, { supabaseUserId: userId });
 }
 
+export async function autoLinkTelegramUserToWebUser(
+  env: Env,
+  tgFrom: { id: number; username?: string; first_name?: string; last_name?: string },
+  webUser: { id: string; email: string; displayName: string; isAdmin: boolean }
+): Promise<TelegramAuthorizedUser> {
+  const reg = await getTelegramAuthRegistry(env);
+  const existing = reg.users[String(tgFrom.id)];
+  const authUser: TelegramAuthorizedUser = {
+    telegramUserId: tgFrom.id,
+    telegramUsername: tgFrom.username || existing?.telegramUsername,
+    firstName: tgFrom.first_name || existing?.firstName,
+    lastName: tgFrom.last_name || existing?.lastName,
+    chatId: existing?.chatId || tgFrom.id,
+    status: 'approved',
+    role: webUser.isAdmin ? 'admin' : existing?.role === 'admin' ? 'admin' : 'inspector',
+    authMethod: existing?.authMethod || 'web_link',
+    supabaseUserId: webUser.id,
+    email: webUser.email || existing?.email,
+    displayName: webUser.displayName || existing?.displayName || tgFrom.first_name || `Telegram #${tgFrom.id}`,
+    linkedAt: existing?.linkedAt || new Date().toISOString(),
+    notificationsEnabled: existing?.notificationsEnabled !== false
+  };
+  reg.users[String(tgFrom.id)] = authUser;
+  await saveTelegramAuthRegistry(env, reg);
+  return authUser;
+}
+
+export async function createSupabaseSessionForTelegramUser(
+  env: Env,
+  authUser: TelegramAuthorizedUser,
+  tgFrom?: { id: number; username?: string; first_name?: string; last_name?: string }
+): Promise<{
+  access_token: string;
+  refresh_token: string;
+  email: string;
+  userId: string;
+} | null> {
+  const sb = getSupabase(env);
+  let email = (authUser.email || '').trim();
+  const isAdmin = authUser.role === 'admin';
+  const displayName =
+    authUser.displayName ||
+    [tgFrom?.first_name, tgFrom?.last_name].filter(Boolean).join(' ') ||
+    tgFrom?.username ||
+    `Inspector #${authUser.telegramUserId}`;
+
+  if (authUser.supabaseUserId) {
+    const { data: uData } = await sb.auth.admin.getUserById(authUser.supabaseUserId);
+    if (uData?.user?.email) {
+      email = uData.user.email;
+    }
+  }
+
+  if (!email) {
+    email = `tg_${authUser.telegramUserId}@ecit.local`;
+  }
+
+  // Ensure a Supabase Auth user exists for this email
+  const { data: createdData } = await sb.auth.admin.createUser({
+    email,
+    email_confirm: true,
+    user_metadata: {
+      display_name: displayName,
+      telegram_user_id: authUser.telegramUserId,
+      telegram_username: authUser.telegramUsername || tgFrom?.username || '',
+      invite_code: 'TELEGRAM-MINIAPP'
+    },
+    app_metadata: {
+      is_room_admin: isAdmin,
+      role: isAdmin ? 'admin' : 'inspector'
+    }
+  });
+
+  const createdUserId = createdData?.user?.id;
+
+  // Generate a magiclink token hash and immediately exchange it for a real session
+  const { data: linkData, error: linkErr } = await sb.auth.admin.generateLink({
+    type: 'magiclink',
+    email
+  });
+  if (linkErr || !linkData) {
+    console.error('generateLink error for Mini App auth:', linkErr);
+    return null;
+  }
+
+  const tokenHash = (linkData as any)?.properties?.hashed_token;
+  if (!tokenHash) {
+    console.error('Missing hashed_token in generateLink response');
+    return null;
+  }
+
+  const { data: otpData, error: otpErr } = await sb.auth.verifyOtp({
+    token_hash: tokenHash,
+    type: 'magiclink'
+  });
+  if (otpErr || !otpData?.session) {
+    console.error('verifyOtp error for Mini App auth:', otpErr);
+    return null;
+  }
+
+  const finalUserId = otpData.user?.id || linkData.user?.id || createdUserId || authUser.supabaseUserId || '';
+
+  // Persist supabaseUserId & email back to tg_auth_registry if not already stored
+  if (finalUserId && (authUser.supabaseUserId !== finalUserId || authUser.email !== email)) {
+    const reg = await getTelegramAuthRegistry(env);
+    const target = reg.users[String(authUser.telegramUserId)];
+    if (target) {
+      target.supabaseUserId = finalUserId;
+      target.email = email;
+      await saveTelegramAuthRegistry(env, reg);
+    }
+  }
+
+  return {
+    access_token: otpData.session.access_token,
+    refresh_token: otpData.session.refresh_token,
+    email,
+    userId: finalUserId
+  };
+}
+
 export async function fetchMicroTaskLibrary(env: Env): Promise<MicroTaskLibrary> {
   try {
     const sb = getSupabase(env);

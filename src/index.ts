@@ -20,6 +20,8 @@ import {
   answerWidgetQuery,
   deleteMessage,
   setMyCommands,
+  setChatMenuButton,
+  verifyTelegramWebAppInitData,
   getFile,
   downloadTelegramFile
 } from './telegram';
@@ -70,6 +72,8 @@ import {
   adminCreateWebUser,
   adminUpdateWebUser,
   adminDeleteWebUser,
+  autoLinkTelegramUserToWebUser,
+  createSupabaseSessionForTelegramUser,
   fetchMicroTaskLibrary,
   humanizeMicroId,
   getRoomFinishMicroTasks,
@@ -132,13 +136,21 @@ export default {
         }
       );
       const tgData: any = await tgRes.json();
-      const cmdData = await setMyCommands(env.TELEGRAM_BOT_TOKEN).catch(e => ({ error: String(e) }));
-      return jsonResponse({ webhook: tgData, commands: cmdData });
+      const [cmdData, menuBtnData] = await Promise.all([
+        setMyCommands(env.TELEGRAM_BOT_TOKEN).catch(e => ({ error: String(e) })),
+        setChatMenuButton(env.TELEGRAM_BOT_TOKEN, WEB_APP_BASE, '🏗️ Site Tracker').catch(e => ({
+          error: String(e)
+        }))
+      ]);
+      return jsonResponse({ webhook: tgData, commands: cmdData, menuButton: menuBtnData });
     }
 
-    // 3. Web App <-> Telegram Auth API (/api/tg-auth)
+    // 3. Web App <-> Telegram Auth API (/api/tg-auth & /api/tg-webapp-auth)
     if (url.pathname === '/api/tg-auth') {
       return handleWebTelegramAuthApi(request, env);
+    }
+    if (url.pathname === '/api/tg-webapp-auth') {
+      return handleWebAppMiniAppAuthApi(request, env);
     }
     if (url.pathname === '/api/notify') {
       return handleWebNotifyApi(request, env, ctx);
@@ -415,6 +427,80 @@ async function handleWebTelegramAuthApi(request: Request, env: Env): Promise<Res
   }
 }
 
+async function handleWebAppMiniAppAuthApi(request: Request, env: Env): Promise<Response> {
+  if (request.method !== 'POST') {
+    return jsonResponse({ ok: false, error: 'Method not allowed' }, 405);
+  }
+  if (!env.TELEGRAM_BOT_TOKEN) {
+    return jsonResponse({ ok: false, error: 'Bot token not configured' }, 500);
+  }
+
+  try {
+    const body: any = await request.json().catch(() => ({}));
+    const initData = String(body.initData || '').trim();
+    if (!initData) {
+      return jsonResponse({ ok: false, error: 'Missing Telegram WebApp initData' }, 400);
+    }
+
+    const verified = await verifyTelegramWebAppInitData(env.TELEGRAM_BOT_TOKEN, initData);
+    if (!verified.ok || !verified.user?.id) {
+      return jsonResponse(
+        { ok: false, error: verified.error || 'Invalid Telegram WebApp signature' },
+        401
+      );
+    }
+
+    const tgFrom = verified.user;
+
+    // 1. If the user already has a valid Supabase web session token, auto-link their Telegram account!
+    const authHeader = request.headers.get('Authorization') || '';
+    const bearerToken = authHeader.replace(/^Bearer\s+/i, '').trim();
+    if (bearerToken) {
+      const webUser = await verifySupabaseUserFromToken(env, bearerToken);
+      if (webUser) {
+        const linkedUser = await autoLinkTelegramUserToWebUser(env, tgFrom, webUser);
+        return jsonResponse({
+          ok: true,
+          mode: 'auto_linked',
+          tgUser: linkedUser
+        });
+      }
+    }
+
+    // 2. Otherwise, check if this Telegram user is already authorized in tg_auth_registry
+    const authUser = await getAuthorizedTelegramUser(env, tgFrom.id);
+    if (!authUser || authUser.status !== 'approved') {
+      return jsonResponse({
+        ok: false,
+        status: authUser?.status || 'unlinked',
+        telegramUserId: tgFrom.id,
+        error:
+          authUser?.status === 'pending'
+            ? 'Your Telegram access request is pending Admin approval.'
+            : 'Telegram account is not linked yet. Sign in once in the Mini App to link automatically.'
+      });
+    }
+
+    // 3. Mint a real Supabase session so the Mini App signs in with zero clicks!
+    const session = await createSupabaseSessionForTelegramUser(env, authUser, tgFrom);
+    if (!session) {
+      return jsonResponse({ ok: false, error: 'Could not create Mini App session' }, 500);
+    }
+
+    return jsonResponse({
+      ok: true,
+      mode: 'session_minted',
+      session: {
+        access_token: session.access_token,
+        refresh_token: session.refresh_token
+      },
+      tgUser: authUser
+    });
+  } catch (e: any) {
+    return jsonResponse({ ok: false, error: e?.message || 'Mini App auth error' }, 500);
+  }
+}
+
 async function broadcastBotChangeNotification(
   env: Env,
   opts: {
@@ -445,13 +531,13 @@ async function broadcastBotChangeNotification(
         callback_data: `b_rm:${opts.roomId}`
       });
       buttons.push({
-        text: '🌐 Open in Web',
-        url: `${WEB_APP_BASE}/#/room/${encodeURIComponent(opts.roomId)}`
+        text: '📱 Mini App',
+        web_app: { url: `${WEB_APP_BASE}/#/room/${encodeURIComponent(opts.roomId)}` }
       });
     } else {
       buttons.push({
-        text: '🌐 Open Web App',
-        url: WEB_APP_BASE
+        text: '📱 Open Mini App',
+        web_app: { url: WEB_APP_BASE }
       });
     }
 
@@ -546,7 +632,7 @@ function mainMenuKeyboard(isAdmin = false): TelegramInlineKeyboardMarkup {
       { text: '👤 My Account', callback_data: 'tg_acc:me' }
     ],
     [
-      { text: '🌐 Open Web App', url: WEB_APP_BASE }
+      { text: '📱 Open Mini App', web_app: { url: WEB_APP_BASE } }
     ]
   ];
   if (isAdmin) {
@@ -572,24 +658,25 @@ function buildAuthRequiredCard(
     `🔒 *ECIT Site Tracker — Authentication Required*\n\n` +
     statusBanner +
     `To view or update site records via Telegram, authenticate using any of these methods:\n\n` +
-    `1️⃣ *Link via Web App (Recommended):*\n` +
-    `Open the [ECIT Web App](${WEB_APP_BASE}) ➔ *Account* ➔ *Link Telegram Bot*, then tap *Open in Telegram* or send:\n` +
+    `1️⃣ *Sign In via Mini App (Zero-Code Auto-Link):*\n` +
+    `Tap *📱 Open Mini App & Sign In* below — signing in inside the Telegram Mini App links your Telegram account automatically!\n\n` +
+    `2️⃣ *Link via Web App Code:*\n` +
+    `Open the [ECIT Web App](${WEB_APP_BASE}) ➔ *Account* ➔ *Link Telegram Bot*, or send:\n` +
     `\`/auth <6-digit-code>\`\n\n` +
-    `2️⃣ *Sign In with Web App Account:*\n` +
+    `3️⃣ *Sign In with Email & Password:*\n` +
     `\`/login your@email.com yourpassword\`\n` +
     `_(Your password message is automatically deleted immediately)_\n\n` +
-    `3️⃣ *Project Invitation Code:*\n` +
-    `\`/auth <INVITE_CODE>\`\n\n` +
-    `4️⃣ *Or Request Admin Approval:*\n` +
-    `Tap *🙋 Request Access* below (Telegram ID: \`${tgUser?.id || 'unknown'}\`).`;
+    `4️⃣ *Project Invitation Code or Admin Approval:*\n` +
+    `Send \`/auth <INVITE_CODE>\` or tap *🙋 Request Access* below (Telegram ID: \`${tgUser?.id || 'unknown'}\`).`;
 
-  const buttons: TelegramInlineKeyboardButton[][] = [];
+  const buttons: TelegramInlineKeyboardButton[][] = [
+    [{ text: '📱 Open Mini App & Sign In', web_app: { url: WEB_APP_BASE } }]
+  ];
   if (!isPending) {
     buttons.push([{ text: '🙋 Request Access from Admin', callback_data: 'tg_req:ask' }]);
   } else {
     buttons.push([{ text: '🔄 Check Approval Status', callback_data: 'tg_req:check' }]);
   }
-  buttons.push([{ text: '🌐 Open Web App Account', url: WEB_APP_BASE }]);
 
   return {
     text,
@@ -1219,7 +1306,10 @@ async function handleMessage(message: any, env: Env): Promise<void> {
 
   // Command: /start or /menu
   if (text.startsWith('/start') || text.startsWith('/menu')) {
-    await setMyCommands(token).catch(() => {});
+    await Promise.all([
+      setMyCommands(token).catch(() => {}),
+      setChatMenuButton(token, WEB_APP_BASE, '🏗️ Site Tracker').catch(() => {})
+    ]);
     const welcome =
       `🏗️ *ECIT Site Tracker Assistant*\n` +
       `👤 Signed in as: *${authUser.displayName}* (${isAdmin ? '🛡️ Admin' : '👷 Inspector'})\n\n` +
@@ -1625,8 +1715,8 @@ function buildRoomDashboardCard(
     });
   }
   actionRow.push({
-    text: '🌐 Web App',
-    url: `${WEB_APP_BASE}/#/room/${encodeURIComponent(room.id)}`
+    text: '📱 Mini App',
+    web_app: { url: `${WEB_APP_BASE}/#/room/${encodeURIComponent(room.id)}` }
   });
   rows.push(actionRow);
 
@@ -2925,8 +3015,15 @@ async function handleCallbackQuery(query: any, env: Env): Promise<void> {
             callback_data: `vroom:${actionId}:${result.room.id}`
           },
           {
-            text: '🌐 Open in Web App',
-            url: `${WEB_APP_BASE}/#/room/${encodeURIComponent(result.room.id)}`
+            text: '📱 Open in Mini App',
+            web_app: { url: `${WEB_APP_BASE}/#/room/${encodeURIComponent(result.room.id)}` }
+          }
+        ]);
+      } else {
+        postButtons.push([
+          {
+            text: '📱 Open Room in Mini App',
+            web_app: { url: `${WEB_APP_BASE}/#/room/${encodeURIComponent(result.room.id)}` }
           }
         ]);
       }

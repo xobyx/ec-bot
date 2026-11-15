@@ -284,6 +284,101 @@ export async function setMyCommands(botToken: string): Promise<any> {
   return await res.json();
 }
 
+export async function setChatMenuButton(
+  botToken: string,
+  webAppUrl: string,
+  text = '🏗️ Site Tracker',
+  chatId?: number | string
+): Promise<any> {
+  const url = `${TELEGRAM_API_BASE}/bot${botToken}/setChatMenuButton`;
+  const body: Record<string, any> = {
+    menu_button: {
+      type: 'web_app',
+      text,
+      web_app: { url: webAppUrl }
+    }
+  };
+  if (chatId !== undefined) {
+    body.chat_id = chatId;
+  }
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+  return await res.json();
+}
+
+export async function verifyTelegramWebAppInitData(
+  botToken: string,
+  initDataRaw: string
+): Promise<{
+  ok: boolean;
+  user?: {
+    id: number;
+    first_name?: string;
+    last_name?: string;
+    username?: string;
+    language_code?: string;
+  };
+  startParam?: string;
+}> {
+  try {
+    if (!initDataRaw || !botToken) return { ok: false };
+    const params = new URLSearchParams(initDataRaw);
+    const hash = params.get('hash');
+    if (!hash) return { ok: false };
+
+    const pairs: string[] = [];
+    params.forEach((val, key) => {
+      if (key !== 'hash') {
+        pairs.push(`${key}=${val}`);
+      }
+    });
+    pairs.sort();
+    const dataCheckString = pairs.join('\n');
+
+    const enc = new TextEncoder();
+    const webAppKey = await crypto.subtle.importKey(
+      'raw',
+      enc.encode('WebAppData'),
+      { name: 'HMAC', hash: 'SHA-256' },
+      false,
+      ['sign']
+    );
+    const secretBytes = await crypto.subtle.sign('HMAC', webAppKey, enc.encode(botToken));
+    const secretKey = await crypto.subtle.importKey(
+      'raw',
+      secretBytes,
+      { name: 'HMAC', hash: 'SHA-256' },
+      false,
+      ['sign']
+    );
+    const sigBytes = new Uint8Array(
+      await crypto.subtle.sign('HMAC', secretKey, enc.encode(dataCheckString))
+    );
+    const computedHex = Array.from(sigBytes)
+      .map(b => b.toString(16).padStart(2, '0'))
+      .join('');
+
+    if (computedHex.toLowerCase() !== hash.toLowerCase()) {
+      return { ok: false };
+    }
+
+    const userStr = params.get('user');
+    const user = userStr ? JSON.parse(userStr) : undefined;
+    if (!user || !user.id) return { ok: false };
+
+    return {
+      ok: true,
+      user,
+      startParam: params.get('start_param') || undefined
+    };
+  } catch {
+    return { ok: false };
+  }
+}
+
 export async function getFile(botToken: string, fileId: string): Promise<{ file_path?: string }> {
   const url = `${TELEGRAM_API_BASE}/bot${botToken}/getFile?file_id=${encodeURIComponent(fileId)}`;
   const res = await fetch(url);
