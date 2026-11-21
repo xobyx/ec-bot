@@ -264,6 +264,7 @@ export async function setMyCommands(botToken: string): Promise<any> {
   const url = `${TELEGRAM_API_BASE}/bot${botToken}/setMyCommands`;
   const commands = [
     { command: 'browse', description: '🧭 Browse levels, zones & rooms interactively' },
+    { command: 'batch', description: '📦 Batch edit multiple rooms sharing a finish code' },
     { command: 'status', description: '📊 Live project progress & KPI widget' },
     { command: 'widget', description: '🧩 Open interactive HTML widget (KPIs or /widget F1-021)' },
     { command: 'snags', description: '⚠️ View & resolve open snags across site' },

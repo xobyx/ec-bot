@@ -327,7 +327,36 @@ export async function applyUndoSnapshot(
   const { data } = await sb.from('kv').select('v').eq('k', key).maybeSingle();
   if (!data?.v) return { ok: false };
 
-  const snap = data.v as RoomUndoSnapshot;
+  const snap = data.v as any;
+
+  // Support multi-room batch undo snapshot
+  if (Array.isArray(snap.batchRooms) && snap.batchRooms.length > 0) {
+    const CHUNK = 6;
+    for (let i = 0; i < snap.batchRooms.length; i += CHUNK) {
+      const part = snap.batchRooms.slice(i, i + CHUNK);
+      await Promise.all(
+        part.map((rSnap: RoomUndoSnapshot) =>
+          sb
+            .from('rooms')
+            .update({
+              notes: rSnap.notes || '',
+              checks: rSnap.checks || {},
+              steps: rSnap.steps || {},
+              log: rSnap.log || [],
+              snags: rSnap.snags || [],
+              photos: rSnap.photos || []
+            })
+            .eq('id', rSnap.roomId)
+        )
+      );
+    }
+    await sb.from('kv').delete().eq('k', key);
+    return {
+      ok: true,
+      roomTitle: snap.batchTitle || `${snap.batchRooms.length} rooms`
+    };
+  }
+
   const room = await getRoomByIdOrCode(env, snap.roomId);
   if (!room) return { ok: false };
 
@@ -1101,6 +1130,116 @@ export async function quickCycleRoomFinish(
 
   if (error) throw error;
   return { room, nextStatus };
+}
+
+/**
+ * Batch updates a finish code status across all rooms matching Level, Zone, Finish Code, and current status filter.
+ */
+export async function batchUpdateRoomsFinish(
+  env: Env,
+  level: number,
+  zone: number,
+  finishCode: string,
+  filterMode: 'all' | 'not_done' | 'pending' | 'ongoing',
+  targetStatus: Status,
+  authorName?: string
+): Promise<{
+  updatedCount: number;
+  sampleCodes: string[];
+  undoId: string;
+} | null> {
+  const rooms = await getRoomsForLevelZone(env, level, zone);
+  const matching = rooms.filter(r => {
+    const cur = r.checks?.[finishCode];
+    if (cur === undefined) return false;
+    if (filterMode === 'not_done') return cur !== 'done';
+    if (filterMode === 'pending') return cur === 'pending' || cur === 'unknown';
+    if (filterMode === 'ongoing') return cur === 'ongoing';
+    return true;
+  });
+
+  if (matching.length === 0) return null;
+
+  const sb = getSupabase(env);
+  const codeTemplates = await getMicroTemplates(env);
+  const tmpl = codeTemplates[finishCode] || [];
+  const nowIso = new Date().toISOString();
+  const author = formatAuthorTag(authorName);
+  const undoId = 'b' + Math.random().toString(36).substring(2, 10);
+
+  const batchSnapshots: RoomUndoSnapshot[] = matching.map(r => ({
+    roomId: r.id,
+    notes: r.notes || '',
+    checks: JSON.parse(JSON.stringify(r.checks || {})),
+    steps: JSON.parse(JSON.stringify(r.steps || {})),
+    log: JSON.parse(JSON.stringify(r.log || [])),
+    snags: JSON.parse(JSON.stringify(r.snags || [])),
+    photos: JSON.parse(JSON.stringify(r.photos || []))
+  }));
+
+  const lvlLabel = level === 0 ? 'GF' : `L${level}`;
+  const znLabel = zone === 0 ? 'All Zones' : `Z${zone}`;
+
+  await sb.from('kv').upsert(
+    {
+      k: `tg_undo:${undoId}`,
+      v: {
+        batchTitle: `${finishCode} on ${lvlLabel} ${znLabel} (${matching.length} rooms)`,
+        batchRooms: batchSnapshots
+      },
+      updated: nowIso
+    },
+    { onConflict: 'k' }
+  );
+
+  const CHUNK = 6;
+  for (let i = 0; i < matching.length; i += CHUNK) {
+    const part = matching.slice(i, i + CHUNK);
+    await Promise.all(
+      part.map(async room => {
+        room.checks = { ...(room.checks || {}), [finishCode]: targetStatus };
+        if (targetStatus === 'done') {
+          const existing = Object.keys(room.steps?.[finishCode] || {});
+          const allMids = new Set([...existing, ...tmpl]);
+          if (allMids.size > 0) {
+            if (!room.steps) room.steps = {};
+            if (!room.steps[finishCode]) room.steps[finishCode] = {};
+            allMids.forEach(mid => {
+              room.steps[finishCode][mid] = 'done';
+            });
+          }
+        }
+        const uid = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+        room.log = [
+          {
+            id: 'l' + uid,
+            ts: nowIso,
+            text: `[Telegram Batch] ${finishCode} (${finishCompactName(finishCode)}) → ${targetStatus.toUpperCase()}`,
+            by: author
+          },
+          ...(room.log || [])
+        ];
+
+        await sb
+          .from('rooms')
+          .update({
+            notes: room.notes || '',
+            checks: room.checks,
+            steps: room.steps || {},
+            log: room.log,
+            snags: room.snags || [],
+            photos: room.photos || []
+          })
+          .eq('id', room.id);
+      })
+    );
+  }
+
+  return {
+    updatedCount: matching.length,
+    sampleCodes: matching.slice(0, 6).map(r => r.spaceCode || r.spaceNo || r.space),
+    undoId
+  };
 }
 
 /**

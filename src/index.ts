@@ -48,6 +48,7 @@ import {
   alignParsedWithRoom,
   applyUpdateToRoom,
   quickCycleRoomFinish,
+  batchUpdateRoomsFinish,
   closeRoomSnag,
   getProjectStats,
   getRoomsWithOpenSnags,
@@ -630,18 +631,19 @@ function mainMenuKeyboard(isAdmin = false): TelegramInlineKeyboardMarkup {
   const rows: TelegramInlineKeyboardButton[][] = [
     [
       { text: '🧭 Browse Rooms', callback_data: 'b_lvl:all' },
-      { text: '📊 Project Status', callback_data: 'b_stats:main' }
+      { text: '📦 Batch Edit', callback_data: 'bt_lvl:all' }
     ],
     [
-      { text: '⚠️ Open Snags', callback_data: 'b_snags:0' },
-      { text: '👤 My Account', callback_data: 'tg_acc:me' }
+      { text: '📊 Project Status', callback_data: 'b_stats:main' },
+      { text: '⚠️ Open Snags', callback_data: 'b_snags:0' }
     ],
     [
+      { text: '👤 My Account', callback_data: 'tg_acc:me' },
       { text: '📱 Open Mini App', web_app: { url: WEB_APP_BASE } }
     ]
   ];
   if (isAdmin) {
-    rows[2].unshift({ text: '🛡️ Telegram Users', callback_data: 'tg_adm:list:0' });
+    rows.push([{ text: '🛡️ Telegram Users', callback_data: 'tg_adm:list:0' }]);
   }
   return { inline_keyboard: rows };
 }
@@ -1391,6 +1393,35 @@ async function handleMessage(message: any, env: Env): Promise<void> {
     return;
   }
 
+  // Command: /batch [level] [finish_code]
+  if (text.startsWith('/batch')) {
+    const arg = text.replace(/^\/batch(?:@\w+)?\s*/i, '').trim().toUpperCase();
+    if (!arg) {
+      const card = buildBatchLevelsCard();
+      await sendMessage(token, chatId, card.text, { reply_markup: card.keyboard });
+      return;
+    }
+    const lvlMatch = arg.match(/\b(?:L|LEVEL\s*)?([0-8]|GF)\b/);
+    const codeMatch = arg.match(/\b([EFWCS]{1,2}\d{2}[A-Z]?)\b/);
+    const znMatch = arg.match(/\bZ(?:ONE\s*)?([1-4])\b/);
+    const lvl = lvlMatch ? (lvlMatch[1] === 'GF' ? 0 : parseInt(lvlMatch[1], 10)) : 1;
+    const zn = znMatch ? parseInt(znMatch[1], 10) : 0;
+
+    if (codeMatch) {
+      const card = await buildBatchRoomsForFinishCard(env, lvl, zn, codeMatch[1], 'all', 0);
+      await sendMessage(token, chatId, card.text, { reply_markup: card.keyboard });
+      return;
+    }
+    if (lvlMatch) {
+      const card = buildBatchZonesCard(lvl);
+      await sendMessage(token, chatId, card.text, { reply_markup: card.keyboard });
+      return;
+    }
+    const card = buildBatchLevelsCard();
+    await sendMessage(token, chatId, card.text, { reply_markup: card.keyboard });
+    return;
+  }
+
   // Command: /room or /photos
   if (text.startsWith('/room') || text.startsWith('/photos')) {
     const isPhotosOnly = text.startsWith('/photos');
@@ -1952,6 +1983,237 @@ async function buildOpenSnagsCard(
     text,
     keyboard: { inline_keyboard: rows }
   };
+}
+
+// ============================================================================
+// INTERACTIVE BATCH FINISH EDITOR (LEVEL -> ZONE -> FINISH CODE -> BATCH APPLY)
+// ============================================================================
+
+function buildBatchLevelsCard(): { text: string; keyboard: TelegramInlineKeyboardMarkup } {
+  const text =
+    `📦 *Batch Edit Rooms by Finish Code*\n\n` +
+    `Update multiple rooms that share the same finish code at once.\n` +
+    `👇 *Step 1: Select a Floor Level:*`;
+
+  const row1: TelegramInlineKeyboardButton[] = [0, 1, 2, 3, 4].map(lvl => ({
+    text: lvl === 0 ? '🏢 GF' : `🏢 L${lvl}`,
+    callback_data: `bt_zn:${lvl}`
+  }));
+  const row2: TelegramInlineKeyboardButton[] = [5, 6, 7, 8].map(lvl => ({
+    text: `🏢 L${lvl}`,
+    callback_data: `bt_zn:${lvl}`
+  }));
+
+  return {
+    text,
+    keyboard: {
+      inline_keyboard: [
+        row1,
+        row2,
+        [
+          { text: '🧭 Browse Rooms', callback_data: 'b_lvl:all' },
+          { text: '📊 Project Status', callback_data: 'b_stats:main' }
+        ]
+      ]
+    }
+  };
+}
+
+function buildBatchZonesCard(level: number): { text: string; keyboard: TelegramInlineKeyboardMarkup } {
+  const lvlName = level === 0 ? 'Ground Floor (GF)' : `Level ${level}`;
+  const text =
+    `📦 *Batch Edit — ${lvlName}*\n\n` +
+    `👇 *Step 2: Select a Zone on ${lvlName} (or All Zones):*`;
+
+  const zRow: TelegramInlineKeyboardButton[] = [1, 2, 3, 4].map(z => ({
+    text: `Zone ${z}`,
+    callback_data: `bt_codes:${level}:${z}`
+  }));
+
+  return {
+    text,
+    keyboard: {
+      inline_keyboard: [
+        zRow,
+        [
+          { text: `🌐 All Zones on ${level === 0 ? 'GF' : 'L' + level}`, callback_data: `bt_codes:${level}:0` },
+          { text: '⬅️ Change Level', callback_data: 'bt_lvl:all' }
+        ]
+      ]
+    }
+  };
+}
+
+async function buildBatchFinishCodesCard(
+  env: Env,
+  level: number,
+  zone: number
+): Promise<{ text: string; keyboard: TelegramInlineKeyboardMarkup }> {
+  const rooms = await getRoomsForLevelZone(env, level, zone);
+  const lvlName = level === 0 ? 'GF' : `L${level}`;
+  const znName = zone === 0 ? 'All Zones' : `Zone ${zone}`;
+
+  const codeStats = new Map<string, { total: number; done: number; ongoing: number }>();
+  for (const r of rooms) {
+    for (const [code, st] of Object.entries(r.checks || {})) {
+      const cur = codeStats.get(code) || { total: 0, done: 0, ongoing: 0 };
+      cur.total++;
+      if (st === 'done') cur.done++;
+      else if (st === 'ongoing') cur.ongoing++;
+      codeStats.set(code, cur);
+    }
+  }
+
+  const sortedCodes = Array.from(codeStats.entries()).sort((a, b) => {
+    if (b[1].total !== a[1].total) return b[1].total - a[1].total;
+    return a[0].localeCompare(b[0]);
+  });
+
+  const lines = sortedCodes.slice(0, 14).map(([code, st]) => {
+    return `• \`${code}\` · ${finishCompactName(code)} — *${st.done}/${st.total} Done* (${st.total} rooms)`;
+  });
+
+  const text =
+    `📦 *Batch Edit Finish — ${lvlName} · ${znName}*\n` +
+    `Found *${sortedCodes.length}* finish codes across *${rooms.length}* rooms.\n\n` +
+    (lines.length ? `${lines.join('\n')}\n\n` : '_No finish codes assigned on this floor/zone._\n\n') +
+    `👇 *Step 3: Tap a finish code to batch-update its rooms:*`;
+
+  const rows: TelegramInlineKeyboardButton[][] = [];
+  const codeButtons: TelegramInlineKeyboardButton[] = sortedCodes.slice(0, 14).map(([code, st]) => ({
+    text: `${code} · ${finishCompactName(code)} (${st.done}/${st.total})`.slice(0, 36),
+    callback_data: `bt_list:${level}:${zone}:${code}:all:0`
+  }));
+
+  for (let i = 0; i < codeButtons.length; i += 2) {
+    rows.push(codeButtons.slice(i, i + 2));
+  }
+
+  rows.push([
+    { text: `🗺️ ${lvlName} Zones`, callback_data: `bt_zn:${level}` },
+    { text: '🏢 All Levels', callback_data: 'bt_lvl:all' }
+  ]);
+
+  return { text, keyboard: { inline_keyboard: rows } };
+}
+
+async function buildBatchRoomsForFinishCard(
+  env: Env,
+  level: number,
+  zone: number,
+  finishCode: string,
+  filterMode: 'all' | 'not_done' | 'pending' | 'ongoing',
+  page: number
+): Promise<{ text: string; keyboard: TelegramInlineKeyboardMarkup }> {
+  const rooms = await getRoomsForLevelZone(env, level, zone);
+  const allWithFinish = rooms.filter(r => r.checks?.[finishCode] !== undefined);
+  const filtered = allWithFinish.filter(r => {
+    const st = r.checks?.[finishCode];
+    if (filterMode === 'not_done') return st !== 'done';
+    if (filterMode === 'pending') return st === 'pending' || st === 'unknown';
+    if (filterMode === 'ongoing') return st === 'ongoing';
+    return true;
+  });
+
+  const lvlName = level === 0 ? 'GF' : `L${level}`;
+  const znName = zone === 0 ? 'All Zones' : `Zone ${zone}`;
+  const doneCount = allWithFinish.filter(r => r.checks?.[finishCode] === 'done').length;
+  const ongoingCount = allWithFinish.filter(r => r.checks?.[finishCode] === 'ongoing').length;
+  const pendingCount = allWithFinish.length - doneCount - ongoingCount;
+
+  const pageSize = 6;
+  const totalPages = Math.max(1, Math.ceil(filtered.length / pageSize));
+  const safePage = Math.min(Math.max(0, page), totalPages - 1);
+  const slice = filtered.slice(safePage * pageSize, (safePage + 1) * pageSize);
+
+  const filterLabel =
+    filterMode === 'not_done'
+      ? 'Not Done (Pending + Ongoing)'
+      : filterMode === 'pending'
+      ? 'Pending Only'
+      : filterMode === 'ongoing'
+      ? 'Ongoing Only'
+      : 'All Matching Rooms';
+
+  const text =
+    `📦 *Batch Edit: ${formatFinishLine(finishCode)}*\n` +
+    `📍 *Scope:* *${lvlName} · ${znName}*\n` +
+    `📊 *Overall:* ✅ ${doneCount} Done · 🔨 ${ongoingCount} Ongoing · ⏳ ${pendingCount} Pending (Total: ${allWithFinish.length})\n` +
+    `🎯 *Active Filter:* *${filterLabel}* (*${filtered.length}* rooms)\n\n` +
+    `💡 _Tap any room below to cycle its ${finishCode} status individually, or use the Batch Set buttons at the bottom to update all *${filtered.length}* filtered rooms at once!_`;
+
+  const rows: TelegramInlineKeyboardButton[][] = [];
+
+  // Filter pills row
+  const filters: Array<{ key: 'all' | 'not_done' | 'pending' | 'ongoing'; label: string }> = [
+    { key: 'all', label: `All (${allWithFinish.length})` },
+    { key: 'not_done', label: `Not Done (${allWithFinish.length - doneCount})` },
+    { key: 'pending', label: `⏳ (${pendingCount})` },
+    { key: 'ongoing', label: `🔨 (${ongoingCount})` }
+  ];
+  rows.push(
+    filters.map(f => ({
+      text: filterMode === f.key ? `● ${f.label}` : f.label,
+      callback_data: `bt_list:${level}:${zone}:${finishCode}:${f.key}:0`
+    }))
+  );
+
+  // Room rows (tap any room to cycle its finish status directly!)
+  for (const rm of slice) {
+    const st = rm.checks?.[finishCode] || 'pending';
+    const code = rm.spaceCode || rm.spaceNo || '';
+    const zTag = zone === 0 && rm.zone ? ` Z${rm.zone}` : '';
+    rows.push([
+      {
+        text: `${statusEmoji(st)} ${code}${zTag} · ${rm.space} (${st.toUpperCase()})`.slice(0, 50),
+        callback_data: `bt_tog:${level}:${zone}:${finishCode}:${filterMode}:${safePage}:${rm.id}`
+      }
+    ]);
+  }
+
+  if (totalPages > 1) {
+    const nav: TelegramInlineKeyboardButton[] = [];
+    if (safePage > 0) {
+      nav.push({
+        text: `⬅️ Page ${safePage}`,
+        callback_data: `bt_list:${level}:${zone}:${finishCode}:${filterMode}:${safePage - 1}`
+      });
+    }
+    if (safePage < totalPages - 1) {
+      nav.push({
+        text: `Page ${safePage + 2} ➡️`,
+        callback_data: `bt_list:${level}:${zone}:${finishCode}:${filterMode}:${safePage + 1}`
+      });
+    }
+    rows.push(nav);
+  }
+
+  // Batch Apply action row for all filtered rooms
+  if (filtered.length > 0) {
+    rows.push([
+      {
+        text: `✅ Set All ${filtered.length} DONE`,
+        callback_data: `bt_apply:${level}:${zone}:${finishCode}:${filterMode}:done`
+      },
+      {
+        text: `🔨 Set All ${filtered.length} ONGOING`,
+        callback_data: `bt_apply:${level}:${zone}:${finishCode}:${filterMode}:ongoing`
+      }
+    ]);
+    rows.push([
+      {
+        text: `⏳ Set All ${filtered.length} PENDING`,
+        callback_data: `bt_apply:${level}:${zone}:${finishCode}:${filterMode}:pending`
+      }
+    ]);
+  }
+
+  rows.push([
+    { text: `⬅️ ${lvlName} Finish Codes`, callback_data: `bt_codes:${level}:${zone}` },
+    { text: '🏢 All Levels', callback_data: 'bt_lvl:all' }
+  ]);
+
+  return { text, keyboard: { inline_keyboard: rows } };
 }
 
 // ============================================================================
@@ -2782,6 +3044,158 @@ async function handleCallbackQuery(query: any, env: Env): Promise<void> {
     if (chatId && messageId) {
       await editMessageText(token, chatId, messageId, card.text, { reply_markup: card.keyboard });
     }
+    return;
+  }
+
+  // --- Interactive Batch Finish Editor Callbacks ---
+  if (actionType === 'bt_lvl') {
+    await answerCallbackQuery(token, query.id);
+    const card = buildBatchLevelsCard();
+    if (chatId && messageId) {
+      await editMessageText(token, chatId, messageId, card.text, { reply_markup: card.keyboard });
+    }
+    return;
+  }
+
+  if (actionType === 'bt_zn') {
+    const lvl = parseInt(actionId, 10) || 0;
+    await answerCallbackQuery(token, query.id);
+    const card = buildBatchZonesCard(lvl);
+    if (chatId && messageId) {
+      await editMessageText(token, chatId, messageId, card.text, { reply_markup: card.keyboard });
+    }
+    return;
+  }
+
+  if (actionType === 'bt_codes') {
+    const lvl = parseInt(actionId, 10) || 0;
+    const zn = parseInt(value, 10) || 0;
+    await answerCallbackQuery(token, query.id, 'Loading finish codes...');
+    const card = await buildBatchFinishCodesCard(env, lvl, zn);
+    if (chatId && messageId) {
+      await editMessageText(token, chatId, messageId, card.text, { reply_markup: card.keyboard });
+    }
+    return;
+  }
+
+  if (actionType === 'bt_list') {
+    const lvl = parseInt(actionId, 10) || 0;
+    const [zStr, code, fMode, pStr] = value.split(':');
+    const zn = parseInt(zStr, 10) || 0;
+    const filterMode = (['all', 'not_done', 'pending', 'ongoing'].includes(fMode) ? fMode : 'all') as
+      | 'all'
+      | 'not_done'
+      | 'pending'
+      | 'ongoing';
+    const page = parseInt(pStr, 10) || 0;
+    await answerCallbackQuery(token, query.id);
+    const card = await buildBatchRoomsForFinishCard(env, lvl, zn, code, filterMode, page);
+    if (chatId && messageId) {
+      await editMessageText(token, chatId, messageId, card.text, { reply_markup: card.keyboard });
+    }
+    return;
+  }
+
+  if (actionType === 'bt_tog') {
+    const lvl = parseInt(actionId, 10) || 0;
+    const [zStr, code, fMode, pStr, ...rmParts] = value.split(':');
+    const zn = parseInt(zStr, 10) || 0;
+    const filterMode = (['all', 'not_done', 'pending', 'ongoing'].includes(fMode) ? fMode : 'all') as
+      | 'all'
+      | 'not_done'
+      | 'pending'
+      | 'ongoing';
+    const page = parseInt(pStr, 10) || 0;
+    const roomId = rmParts.join(':');
+
+    const updated = await quickCycleRoomFinish(env, roomId, code, authorName);
+    if (updated) {
+      await answerCallbackQuery(
+        token,
+        query.id,
+        `${updated.room.spaceCode || updated.room.space}: ${code} → ${updated.nextStatus.toUpperCase()}`
+      );
+      const card = await buildBatchRoomsForFinishCard(env, lvl, zn, code, filterMode, page);
+      if (chatId && messageId) {
+        await editMessageText(token, chatId, messageId, card.text, { reply_markup: card.keyboard });
+      }
+    } else {
+      await answerCallbackQuery(token, query.id, 'Could not toggle room finish', true);
+    }
+    return;
+  }
+
+  if (actionType === 'bt_apply') {
+    const lvl = parseInt(actionId, 10) || 0;
+    const [zStr, code, fMode, targetSt] = value.split(':');
+    const zn = parseInt(zStr, 10) || 0;
+    const filterMode = (['all', 'not_done', 'pending', 'ongoing'].includes(fMode) ? fMode : 'all') as
+      | 'all'
+      | 'not_done'
+      | 'pending'
+      | 'ongoing';
+    const targetStatus = (['pending', 'ongoing', 'done'].includes(targetSt) ? targetSt : 'done') as Status;
+
+    await answerCallbackQuery(
+      token,
+      query.id,
+      `Applying ${code} → ${targetStatus.toUpperCase()}...`
+    );
+
+    const res = await batchUpdateRoomsFinish(
+      env,
+      lvl,
+      zn,
+      code,
+      filterMode,
+      targetStatus,
+      authorName
+    );
+    if (!res) {
+      if (chatId) {
+        await sendMessage(token, chatId, `ℹ️ No matching rooms needed updating for \`${code}\`.`);
+      }
+      return;
+    }
+
+    const lvlName = lvl === 0 ? 'GF' : `L${lvl}`;
+    const znName = zn === 0 ? 'All Zones' : `Zone ${zn}`;
+    const sampleText = res.sampleCodes.join(', ');
+
+    const successText =
+      `✅ *Batch Finish Update Complete!*\n\n` +
+      `• *Finish:* ${formatFinishLine(code)} ➔ *${targetStatus.toUpperCase()}*\n` +
+      `• *Scope:* *${lvlName} · ${znName}*\n` +
+      `• *Updated Rooms (${res.updatedCount}):* \`${sampleText}\`${res.updatedCount > res.sampleCodes.length ? ` _+${res.updatedCount - res.sampleCodes.length} more_` : ''}\n` +
+      `• *By:* *${authorName}*`;
+
+    if (chatId && messageId) {
+      await editMessageText(token, chatId, messageId, successText, {
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: '↩️ Undo Batch Update', callback_data: `undo:${res.undoId}` },
+              {
+                text: `📦 View ${code} List`,
+                callback_data: `bt_list:${lvl}:${zn}:${code}:all:0`
+              }
+            ],
+            [
+              { text: `🎨 Other ${lvlName} Finishes`, callback_data: `bt_codes:${lvl}:${zn}` },
+              { text: '🏠 Main Menu', callback_data: 'b_stats:main' }
+            ]
+          ]
+        }
+      });
+    }
+
+    await broadcastBotChangeNotification(env, {
+      source: 'telegram',
+      roomTitle: `${lvlName} ${znName} (${res.updatedCount} rooms)`,
+      summary: `📦 Batch ${code} (${finishCompactName(code)}) ➔ ${targetStatus.toUpperCase()} (${sampleText})`,
+      by: authorName,
+      excludeTelegramUserId: tgUserId
+    });
     return;
   }
 
